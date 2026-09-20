@@ -4205,7 +4205,10 @@ mod tests {
             &[call_id.clone()],
             &["task".to_string()],
         ));
-        assert_eq!(obs.entry.store_record_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            obs.entry.store_record_hash.as_deref(),
+            Some(expected.as_str())
+        );
         d3_cleanup();
     }
 
@@ -4306,11 +4309,9 @@ mod tests {
             .expect("final body has functionCall id at reported index");
         assert_eq!(id_at, call_id);
         assert_eq!(d3_tool_hash(id_at), obs.tool_id_hash);
-        assert!(
-            body["request"]["contents"][0]["parts"][0]
-                .get("functionCall")
-                .is_none()
-        );
+        assert!(body["request"]["contents"][0]["parts"][0]
+            .get("functionCall")
+            .is_none());
         d3_cleanup();
     }
 
@@ -4348,10 +4349,9 @@ mod tests {
         }
         // Tool-bearing observations still report the salted tool id hash, as
         // before D4. Thought observations carry tool_id_hash=none by design.
-        for line in lines
-            .iter()
-            .filter(|l| l.contains("part_kind=functionCall") || l.contains("part_kind=functionResponse"))
-        {
+        for line in lines.iter().filter(|l| {
+            l.contains("part_kind=functionCall") || l.contains("part_kind=functionResponse")
+        }) {
             assert!(line.contains(&d3_tool_hash(&call_id)));
         }
         d3_cleanup();
@@ -4531,11 +4531,7 @@ mod tests {
         }
     }
 
-    fn v2b_historical_parallel_request(
-        session: &str,
-        call_a: &str,
-        call_b: &str,
-    ) -> OpenAIRequest {
+    fn v2b_historical_parallel_request(session: &str, call_a: &str, call_b: &str) -> OpenAIRequest {
         OpenAIRequest {
             model: "gemini-3-pro".to_string(),
             session_id: Some(session.to_string()),
@@ -4782,8 +4778,7 @@ mod tests {
         let session = v2a_unique_key("v2b8");
         let call_a = format!("call_v2b8a_{}", uuid::Uuid::new_v4());
         let call_b = format!("call_v2b8b_{}", uuid::Uuid::new_v4());
-        crate::proxy::SignatureCache::global()
-            .cache_tool_signature(&call_a, V2A_SIG_A.to_string());
+        crate::proxy::SignatureCache::global().cache_tool_signature(&call_a, V2A_SIG_A.to_string());
         v2a_cache_session_sig(&session, V2A_SIG_B);
 
         let req = v2b_historical_parallel_request(&session, &call_a, &call_b);
@@ -5149,7 +5144,10 @@ mod tests {
         assert_eq!(t.entry.source, SigSource::PerTurnStore);
         assert_eq!(t.entry.restore_phase, RestorePhase::P1ToolId);
         assert!(
-            t.entry.store_record_hash.as_deref().is_some_and(|h| h != "none"),
+            t.entry
+                .store_record_hash
+                .as_deref()
+                .is_some_and(|h| h != "none"),
             "restore must report a store_record_hash"
         );
         assert_eq!(t.entry.store_record_hash.as_deref().map(str::len), Some(16));
@@ -5266,7 +5264,10 @@ mod tests {
         let lines = d3_lines(&body);
         assert!(!lines.is_empty());
         for line in &lines {
-            assert!(!line.contains(&raw_thought), "raw thought text leaked: {line}");
+            assert!(
+                !line.contains(&raw_thought),
+                "raw thought text leaked: {line}"
+            );
             assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
             assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
             assert!(
@@ -5459,7 +5460,12 @@ mod tests {
         d3_enable();
         let session = v2a_unique_key("v2d3");
         let call_id = format!("call_v2d3_{}", uuid::Uuid::new_v4());
-        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative per-turn thought v2d3");
+        v2a_seed_tool_record(
+            &session,
+            &call_id,
+            V2A_SIG_A,
+            "authoritative per-turn thought v2d3",
+        );
         v2a_cache_session_sig(&session, V2A_SIG_B);
         let req = v2b_historical_request(&session, &call_id);
         let body = v2b_transform_historical(&req);
@@ -5737,7 +5743,10 @@ mod tests {
         let lines = d3_lines(&body);
         assert!(!lines.is_empty());
         for line in &lines {
-            assert!(!line.contains(&raw_thought), "raw thought text leaked: {line}");
+            assert!(
+                !line.contains(&raw_thought),
+                "raw thought text leaked: {line}"
+            );
             assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
             assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
             assert!(
@@ -5761,8 +5770,7 @@ mod tests {
         let call_b = format!("call_v2d15b_{}", uuid::Uuid::new_v4());
         // Call A resolves to an authoritative tool-cache REAL; call B is an
         // unresolved session-latest fallback (V2B-8 shape).
-        crate::proxy::SignatureCache::global()
-            .cache_tool_signature(&call_a, V2A_SIG_A.to_string());
+        crate::proxy::SignatureCache::global().cache_tool_signature(&call_a, V2A_SIG_A.to_string());
         v2a_cache_session_sig(&session, V2A_SIG_B);
         let req = v2b_historical_parallel_request(&session, &call_a, &call_b);
         let body = v2b_transform_historical(&req);

@@ -358,8 +358,7 @@ pub async fn fetch_quota_with_cache(
                             "Quota API {} returned {}, falling back to next endpoint",
                             ep_url, status
                         ));
-                        last_error =
-                            Some(AppError::Unknown(format!("HTTP {} - {}", status, text)));
+                        last_error = Some(AppError::Unknown(format!("HTTP {} - {}", status, text)));
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         continue; // 换下一个 endpoint
                     }

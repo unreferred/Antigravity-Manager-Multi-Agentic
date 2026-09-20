@@ -119,7 +119,8 @@ pub fn parse_historical_session_fallback_stability_flag(value: Option<&str>) -> 
 /// Returns the effective V2B historical session-fallback stability mode.
 pub fn historical_session_fallback_stability_enabled() -> bool {
     #[cfg(test)]
-    if let Some(forced) = HISTORICAL_SESSION_FALLBACK_STABILITY_TEST_OVERRIDE.with(|cell| cell.get())
+    if let Some(forced) =
+        HISTORICAL_SESSION_FALLBACK_STABILITY_TEST_OVERRIDE.with(|cell| cell.get())
     {
         return forced;
     }
@@ -734,10 +735,10 @@ impl ThinkingStore {
         }
 
         // [D4] OBSERVABILITY ONLY: restore thoughts are recorded by their ordinal in
-    // the order restore inserts them. The final-body scan overlays these on top
-    // of the builder thought slots by ordinal (restore wins), because restore
-    // runs after the builder and cannot know which builder slot it replaces.
-    let mut restore_thought_ordinal: usize = 0;
+        // the order restore inserts them. The final-body scan overlays these on top
+        // of the builder thought slots by ordinal (restore wins), because restore
+        // runs after the builder and cannot know which builder slot it replaces.
+        let mut restore_thought_ordinal: usize = 0;
         let mut restored = 0usize;
         for turn in model_turns {
             if turn.already_complete {
@@ -813,9 +814,8 @@ impl ThinkingStore {
             // record by the running restore ordinal regardless of the builder
             // slot the restore actually replaced.
             if crate::proxy::signature_source_diagnostics::is_enabled() {
-                let rec_hash = crate::proxy::signature_source_diagnostics::store_record_hash(
-                    &rec.fingerprint,
-                );
+                let rec_hash =
+                    crate::proxy::signature_source_diagnostics::store_record_hash(&rec.fingerprint);
                 let phase_tag = turn.matched_phase.unwrap_or("NONE");
                 crate::proxy::signature_source_diagnostics::record_restore_thought(
                     restore_thought_ordinal,
@@ -3308,7 +3308,9 @@ mod tests {
         assert!(!parse_historical_session_fallback_stability_flag(None));
         assert!(!parse_historical_session_fallback_stability_flag(Some("0")));
         assert!(parse_historical_session_fallback_stability_flag(Some("1")));
-        assert!(parse_historical_session_fallback_stability_flag(Some("true")));
+        assert!(parse_historical_session_fallback_stability_flag(Some(
+            "true"
+        )));
     }
 
     #[test]

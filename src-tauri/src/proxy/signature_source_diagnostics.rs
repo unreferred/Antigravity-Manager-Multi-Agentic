@@ -387,7 +387,11 @@ pub(crate) fn begin_plan() -> SigPlanGuard {
 
 /// Record the builder-selected source for one functionCall. Cheap no-op when
 /// diagnostics are disabled or no plan is active.
-pub(crate) fn record_builder_function_call(tool_id: &str, source: SigSource, fallback_marked: bool) {
+pub(crate) fn record_builder_function_call(
+    tool_id: &str,
+    source: SigSource,
+    fallback_marked: bool,
+) {
     if !is_enabled() {
         return;
     }
@@ -889,7 +893,12 @@ mod tests {
         set_enabled_for_tests(true);
         let fc_key = plan_key(PartKind::FunctionCall, "call_1");
         let mut plan = SigPlan::default();
-        plan.record_builder(PartKind::FunctionCall, "call_1", SigSource::SessionFallback, true);
+        plan.record_builder(
+            PartKind::FunctionCall,
+            "call_1",
+            SigSource::SessionFallback,
+            true,
+        );
         assert_eq!(
             plan.entries.get(&fc_key).unwrap().source,
             SigSource::SessionFallback
@@ -900,7 +909,12 @@ mod tests {
         assert_eq!(e.restore_phase, RestorePhase::P1ToolId);
         assert_eq!(e.store_record_hash.as_deref(), Some("hash123"));
         // A later builder record must not clobber the restore.
-        plan.record_builder(PartKind::FunctionCall, "call_1", SigSource::ToolCache, false);
+        plan.record_builder(
+            PartKind::FunctionCall,
+            "call_1",
+            SigSource::ToolCache,
+            false,
+        );
         assert_eq!(
             plan.entries.get(&fc_key).unwrap().source,
             SigSource::PerTurnStore
@@ -914,7 +928,12 @@ mod tests {
         let fc_key = plan_key(PartKind::FunctionCall, "call_1");
         let fr_key = plan_key(PartKind::FunctionResponse, "call_1");
         let mut plan = SigPlan::default();
-        plan.record_builder(PartKind::FunctionCall, "call_1", SigSource::ToolCache, false);
+        plan.record_builder(
+            PartKind::FunctionCall,
+            "call_1",
+            SigSource::ToolCache,
+            false,
+        );
         plan.record_builder(
             PartKind::FunctionResponse,
             "call_1",
@@ -1051,7 +1070,13 @@ mod tests {
             // Builder recorded a session fallback for slot 0 ...
             record_builder_thought(0, SigSource::SessionFallback, true, None);
             // ... but an authoritative ThinkingStore restore replaced it.
-            record_restore_thought(0, "P1_TOOL_ID", "rechash", true, Some(thought_fingerprint_hash("recfp")));
+            record_restore_thought(
+                0,
+                "P1_TOOL_ID",
+                "rechash",
+                true,
+                Some(thought_fingerprint_hash("recfp")),
+            );
             finish_plan(&json!({"requestId": "d4_unit_r2"}));
         }
         let body = json!({
@@ -1061,8 +1086,15 @@ mod tests {
             ]}
         });
         let obs = observations_for_body(&body);
-        let t = obs.iter().find(|o| o.entry.part_kind == PartKind::Thought).unwrap();
-        assert_eq!(t.entry.source, SigSource::PerTurnStore, "restore wins over builder");
+        let t = obs
+            .iter()
+            .find(|o| o.entry.part_kind == PartKind::Thought)
+            .unwrap();
+        assert_eq!(
+            t.entry.source,
+            SigSource::PerTurnStore,
+            "restore wins over builder"
+        );
         assert_eq!(t.entry.restore_phase, RestorePhase::P1ToolId);
         assert_eq!(t.entry.store_record_hash.as_deref(), Some("rechash"));
         clear_enabled_for_tests();

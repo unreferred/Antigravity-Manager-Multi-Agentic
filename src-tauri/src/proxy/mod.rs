@@ -10,7 +10,6 @@ pub mod token_manager;
 // 新架构模块
 pub mod audio; // 音频处理模块
 pub mod cache_diagnostics; // [CACHE-DIAG] 只读缓存诊断 (OBSERVABILITY ONLY)
-pub mod signature_source_diagnostics; // [CACHE-SIG-SOURCE] 只读签名来源归因 (OBSERVABILITY ONLY)
 pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
 pub mod cli_sync; // CLI 配置同步 (v3.3.35)
 pub mod common; // 公共工具
@@ -29,6 +28,7 @@ pub mod proxy_pool; // 代理池管理器
 pub mod rate_limit; // 限流跟踪
 pub mod session_manager; // 会话指纹管理
 pub mod signature_cache; // Signature Cache (v3.3.16)
+pub mod signature_source_diagnostics; // [CACHE-SIG-SOURCE] 只读签名来源归因 (OBSERVABILITY ONLY)
 pub mod sticky_config; // 粘性调度配置
 pub mod thinking_store; // 服务端完整思考块存储
 pub mod upstream; // 上游客户端
