@@ -39,6 +39,16 @@ pub const SIGNATURE_OWNERSHIP_ENV: &str = "ABV_SIGNATURE_OWNERSHIP";
 /// never reaches the upstream wire payload.
 pub(crate) const SIG_FALLBACK_MARKER: &str = "_abv_sig_fallback";
 
+/// [V2D] Internal, request-scoped tag set by the historical-session-fallback
+/// stabilizer on a THOUGHT part it neutralized to the sentinel. Finalize strips
+/// the V2A `SIG_FALLBACK_MARKER` before its sibling-REAL alignment pass, so
+/// without this tag a stabilized historical fallback thought would be
+/// indistinguishable from a legacy sentinel placeholder and could be upgraded
+/// back to a mutable sibling REAL. The tag lets finalize skip that alignment for
+/// exactly these thoughts and is stripped before serialization, so it never
+/// reaches the upstream wire payload.
+pub(crate) const V2D_STABILIZED_THOUGHT_MARKER: &str = "_abv_v2d_stab_thought";
+
 #[cfg(test)]
 thread_local! {
     static SIGNATURE_OWNERSHIP_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
@@ -723,6 +733,11 @@ impl ThinkingStore {
             }
         }
 
+        // [D4] OBSERVABILITY ONLY: restore thoughts are recorded by their ordinal in
+    // the order restore inserts them. The final-body scan overlays these on top
+    // of the builder thought slots by ordinal (restore wins), because restore
+    // runs after the builder and cannot know which builder slot it replaces.
+    let mut restore_thought_ordinal: usize = 0;
         let mut restored = 0usize;
         for turn in model_turns {
             if turn.already_complete {
@@ -793,6 +808,28 @@ impl ThinkingStore {
                 }
             }
             parts.insert(0, thought_part);
+            // [D4] OBSERVABILITY ONLY: attribute this restored thought part. The
+            // final scan maps the Nth final thought part to restore slot N, so
+            // record by the running restore ordinal regardless of the builder
+            // slot the restore actually replaced.
+            if crate::proxy::signature_source_diagnostics::is_enabled() {
+                let rec_hash = crate::proxy::signature_source_diagnostics::store_record_hash(
+                    &rec.fingerprint,
+                );
+                let phase_tag = turn.matched_phase.unwrap_or("NONE");
+                crate::proxy::signature_source_diagnostics::record_restore_thought(
+                    restore_thought_ordinal,
+                    phase_tag,
+                    &rec_hash,
+                    turn.sig_fallback_stamped,
+                    Some(
+                        crate::proxy::signature_source_diagnostics::thought_fingerprint_hash(
+                            &rec.fingerprint,
+                        ),
+                    ),
+                );
+                restore_thought_ordinal += 1;
+            }
             // [CACHE-SIG-SOURCE] OBSERVABILITY ONLY: attribute the FINAL effective
             // source for each functionCall when a real per-turn signature was
             // stamped. No-op (and no hashing) when diagnostics are disabled.
@@ -1199,19 +1236,48 @@ pub fn capture_gemini_response(store_key: &str, response: &Value) {
 /// `restore_gemini_contents` clears it as soon as an authoritative per-turn REAL
 /// is stamped. Authoritative tool-cache / trusted-client / restored signatures
 /// therefore never carry the marker and are left untouched.
-fn stabilize_historical_session_fallback_parts(content: &mut Value) -> usize {
+fn stabilize_historical_session_fallback_parts(
+    content: &mut Value,
+    thought_ordinal_base: usize,
+) -> usize {
     let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) else {
         return 0;
     };
     let mut stabilized = 0usize;
+    // [D4] Running ordinal of `thought==true` parts within this content, in part
+    // order. A stabilized thought reports its final thought ordinal as
+    // `thought_ordinal_base + local_thought_index`, mirroring the final scan.
+    let mut local_thought_index = 0usize;
     for part in parts.iter_mut() {
+        let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
         let marked = part
             .get(SIG_FALLBACK_MARKER)
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Count every thought part exactly once, whether or not it is marked.
+        let this_thought_ordinal = if is_thought {
+            let o = local_thought_index;
+            local_thought_index += 1;
+            Some(o)
+        } else {
+            None
+        };
         if !marked {
             continue;
         }
+        // Snapshot provenance before mutating so we know which part kind it was.
+        let is_function_call = part.get("functionCall").is_some();
+        let is_function_response = part.get("functionResponse").is_some();
+        let call_id = part
+            .get("functionCall")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let fr_id = part
+            .get("functionResponse")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let Some(obj) = part.as_object_mut() else {
             continue;
         };
@@ -1222,21 +1288,48 @@ fn stabilize_historical_session_fallback_parts(content: &mut Value) -> usize {
             .and_then(|s| s.as_str())
             .map(is_real_signature)
             .unwrap_or(false);
+        // [V2D] A historical THOUGHT part whose signature provenance is still the
+        // unresolved session fallback must be neutralized to the sentinel even if
+        // it already holds the sentinel: finalize's sibling-REAL alignment would
+        // otherwise resurrect a mutable sibling REAL into it. This is provenance-
+        // based (the part still carries the V2A fallback marker) and never applies
+        // to authoritative restored/PER_TURN_STORE thoughts, whose marker the
+        // restore path clears. functionCall / functionResponse behavior (V2B/V2C)
+        // keeps its existing "still-present REAL only" rule below.
+        if is_thought {
+            obj.remove("thought_signature");
+            obj.insert("thoughtSignature".to_string(), json!(SENTINEL_SIGNATURE));
+            obj.insert(V2D_STABILIZED_THOUGHT_MARKER.to_string(), json!(true));
+            // [D4] A stabilized thought part reports STABILIZED_TO_SENTINEL on its
+            // own (id-less) thought slot. This never changes stabilization behavior.
+            if let Some(local) = this_thought_ordinal {
+                crate::proxy::signature_source_diagnostics::record_v2b_action_thought(
+                    thought_ordinal_base + local,
+                    crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
+                );
+            }
+            stabilized += 1;
+            continue;
+        }
         if !has_real {
             continue;
         }
         obj.remove("thought_signature");
         obj.insert("thoughtSignature".to_string(), json!(SENTINEL_SIGNATURE));
-        if let Some(id) = obj
-            .get("functionCall")
-            .and_then(|f| f.get("id"))
-            .and_then(|v| v.as_str())
-        {
-            crate::proxy::signature_source_diagnostics::record_v2b_action(
-                id,
-                crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
-            );
-        }
+        // [V2C] Attribute by part kind: functionResponse signature slots are
+        // joined by their own raw tool id just like functionCall slots.
+        use crate::proxy::signature_source_diagnostics::{PartKind, V2bAction};
+        crate::proxy::signature_source_diagnostics::record_v2b_action(
+            if is_function_call {
+                PartKind::FunctionCall
+            } else {
+                PartKind::FunctionResponse
+            },
+            call_id.as_deref().or(fr_id.as_deref()).unwrap_or(""),
+            V2bAction::StabilizedToSentinel,
+        );
+        // Non-thought marker-bearing parts keep their existing attribution.
+        let _ = is_function_response;
         stabilized += 1;
     }
     stabilized
@@ -1250,17 +1343,23 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
     let v2b_enabled = historical_session_fallback_stability_enabled();
     let last_model_idx = contents.iter().rposition(is_model_or_assistant);
 
+    // [D4] OBSERVABILITY ONLY: running ordinal of every thought part in the
+    // FINAL contents ordering. Finalize reorders thoughts to the front of each
+    // turn and may synthesize one, so this mirrors the final-body scan's thought
+    // ordinal and lets finalize/stabilizer attribution be overlaid by ordinal.
+    let mut final_thought_ordinal: usize = 0;
+
     for (idx, msg) in contents.iter_mut().enumerate() {
         let is_model = is_model_or_assistant(msg);
+        // [V2B/V2C] The historical span is every content BEFORE the live/last
+        // model turn, regardless of role: historical model turns and user-role
+        // functionResponse slots alike. The stabilizer is marker-driven, so
+        // authoritative parts remain untouched. idx >= last_model_idx is never
+        // stabilized, preserving trailing/live functionResponse behavior.
+        let is_historical = last_model_idx.map(|last| idx < last).unwrap_or(false);
 
-        // [V2B] Apply the unresolved historical session-fallback policy while the
-        // internal markers are still present (they are stripped just below).
-        if v2b_enabled && is_thinking_enabled && is_model {
-            if let Some(last) = last_model_idx {
-                if idx < last {
-                    stabilize_historical_session_fallback_parts(msg);
-                }
-            }
+        if v2b_enabled && is_thinking_enabled && is_historical {
+            stabilize_historical_session_fallback_parts(msg, final_thought_ordinal);
         }
 
         // V2A markers are internal to the request pipeline only; never let them
@@ -1283,6 +1382,26 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
         }
 
         if !is_model {
+            // [V2C] Non-model (e.g. user functionResponse) parts never enter the
+            // model cleanup below, so strip the internal marker here after
+            // stabilization has consumed it.
+            if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                for part in parts.iter_mut() {
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.remove(SIG_FALLBACK_MARKER);
+                        obj.remove(V2D_STABILIZED_THOUGHT_MARKER);
+                    }
+                }
+            }
+            // [D4] OBSERVABILITY ONLY: mirror the final scan's thought ordinal for
+            // surviving thought parts on non-model contents.
+            if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                        final_thought_ordinal += 1;
+                    }
+                }
+            }
             continue;
         }
 
@@ -1325,6 +1444,15 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
                     }
                 });
 
+                // [D4] OBSERVABILITY ONLY: the final-thought ordinal of the first
+                // thought part of this message. `thinking_parts` are emitted at
+                // the front of this message's parts, so the n-th `thought==true`
+                // entry within them lands at `finalize_base_ordinal + n`. This
+                // mirrors the final-body scan, which counts every `thought==true`
+                // part in contents/parts order.
+                let finalize_base_ordinal = final_thought_ordinal;
+                let diagnostics_on = crate::proxy::signature_source_diagnostics::is_enabled();
+
                 if thinking_parts.is_empty() {
                     // 优先继承本轮工具调用身上的真实加密签名
                     let turn_sig = turn_real_sig.as_deref().unwrap_or(SENTINEL_SIGNATURE);
@@ -1334,17 +1462,46 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
                         "thought": true,
                         "thoughtSignature": turn_sig,
                     }));
+                    // [D4] A synthesized thought that inherited a sibling REAL is
+                    // attributed FINALIZE_SIBLING_REAL. If provenance is unknown
+                    // (sentinel fallback), leave attribution untouched.
+                    if diagnostics_on && turn_real_sig.is_some() {
+                        crate::proxy::signature_source_diagnostics::record_finalize_thought_source(
+                            finalize_base_ordinal,
+                            crate::proxy::signature_source_diagnostics::SigSource::FinalizeSiblingReal,
+                        );
+                    }
                 } else if let Some(ref real_sig) = turn_real_sig {
                     // Thought placeholder/sentinel must not block a real tool signature that
                     // SignatureCache or ThinkingStore already placed on functionCall.
+                    let mut thought_ordinal = 0usize;
                     for tp in thinking_parts.iter_mut() {
+                        // [V2D] A historical fallback thought the stabilizer already
+                        // neutralized to the sentinel must NOT be resurrected by a
+                        // mutable sibling REAL. Provenance was recorded on the part.
+                        let v2d_stabilized = tp
+                            .get(V2D_STABILIZED_THOUGHT_MARKER)
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let valid = tp
                             .get("thoughtSignature")
                             .and_then(|s| s.as_str())
                             .map(is_real_signature)
                             .unwrap_or(false);
-                        if !valid {
+                        let is_thought = tp.get("thought").and_then(|t| t.as_bool()) == Some(true);
+                        if !valid && !v2d_stabilized {
                             tp["thoughtSignature"] = json!(real_sig);
+                            // [D4] Only a thought part that was upgraded from a
+                            // non-authoritative signature reports FINALIZE_SIBLING_REAL.
+                            if diagnostics_on && is_thought {
+                                crate::proxy::signature_source_diagnostics::record_finalize_thought_source(
+                                    finalize_base_ordinal + thought_ordinal,
+                                    crate::proxy::signature_source_diagnostics::SigSource::FinalizeSiblingReal,
+                                );
+                            }
+                        }
+                        if is_thought {
+                            thought_ordinal += 1;
                         }
                     }
                 } else {
@@ -1361,6 +1518,31 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
                     {
                         part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
                     }
+                }
+
+                // [D4] Advance the global final-thought ordinal past every
+                // `thought==true` part emitted by this message (thinking parts are
+                // emitted first, then other parts).
+                if diagnostics_on {
+                    for tp in thinking_parts.iter() {
+                        if tp.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                            final_thought_ordinal += 1;
+                        }
+                    }
+                    for op in other_parts.iter() {
+                        if op.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                            final_thought_ordinal += 1;
+                        }
+                    }
+                } else {
+                    final_thought_ordinal += thinking_parts
+                        .iter()
+                        .filter(|tp| tp.get("thought").and_then(|t| t.as_bool()) == Some(true))
+                        .count();
+                    final_thought_ordinal += other_parts
+                        .iter()
+                        .filter(|op| op.get("thought").and_then(|t| t.as_bool()) == Some(true))
+                        .count();
                 }
 
                 // 思考块始终强制排在最前面，其他部件紧随其后
@@ -1382,6 +1564,14 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
             }
 
             parts.extend(other_parts);
+
+            // [V2D] The stabilization tag is consumed by the alignment pass above
+            // and must never reach the upstream wire payload.
+            for part in parts.iter_mut() {
+                if let Some(obj) = part.as_object_mut() {
+                    obj.remove(V2D_STABILIZED_THOUGHT_MARKER);
+                }
+            }
         }
     }
 }
@@ -3212,5 +3402,86 @@ mod tests {
                 assert!(part.get(SIG_FALLBACK_MARKER).is_none());
             }
         }
+    }
+
+    // ==================================================================
+    // [V2C] Historical functionResponse signature stability
+    // ==================================================================
+
+    fn v2c_marked_fr(id: &str, sig: &str) -> Value {
+        let mut part = json!({
+            "functionResponse": { "name": "task", "response": { "result": "ok" }, "id": id },
+            "thoughtSignature": sig,
+        });
+        part[SIG_FALLBACK_MARKER] = json!(true);
+        part
+    }
+
+    fn v2c_fr_sig(content: &Value, id: &str) -> Option<String> {
+        content["parts"]
+            .as_array()?
+            .iter()
+            .find(|p| p["functionResponse"]["id"].as_str() == Some(id))
+            .and_then(|p| p["thoughtSignature"].as_str().map(str::to_string))
+    }
+
+    #[test]
+    fn v2c_finalize_stabilizes_historical_function_response_only() {
+        let mut contents = vec![
+            json!({ "role": "model", "parts": [{ "text": "historical model" }] }),
+            json!({ "role": "user", "parts": [v2c_marked_fr("call_v2c_hist_fr", V2A_STORE_SIG_A)] }),
+            json!({ "role": "model", "parts": [{ "text": "live model" }] }),
+            json!({ "role": "user", "parts": [v2c_marked_fr("call_v2c_live_fr", V2A_STORE_SIG_B)] }),
+        ];
+
+        set_historical_session_fallback_stability_override(Some(true));
+        finalize_gemini_contents_thinking(&mut contents, true);
+        set_historical_session_fallback_stability_override(None);
+
+        assert_eq!(
+            v2c_fr_sig(&contents[1], "call_v2c_hist_fr").as_deref(),
+            Some(SENTINEL_SIGNATURE),
+            "historical unresolved functionResponse must be stabilized"
+        );
+        assert_eq!(
+            v2c_fr_sig(&contents[3], "call_v2c_live_fr").as_deref(),
+            Some(V2A_STORE_SIG_B),
+            "trailing/live functionResponse must stay REAL"
+        );
+        for content in &contents {
+            for part in content["parts"].as_array().unwrap() {
+                assert!(
+                    part.get(SIG_FALLBACK_MARKER).is_none(),
+                    "internal marker must be stripped from every part"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2c_finalize_tool_cache_function_response_never_sentinel() {
+        // An authoritative functionResponse has no marker, so even the historical
+        // stabilizer must leave it byte-identical.
+        let mut contents = vec![
+            json!({ "role": "model", "parts": [{ "text": "historical model" }] }),
+            json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": { "name": "task", "response": { "result": "ok" }, "id": "call_v2c_auth" },
+                    "thoughtSignature": V2A_STORE_SIG_A,
+                }]
+            }),
+            json!({ "role": "model", "parts": [{ "text": "live model" }] }),
+        ];
+
+        set_historical_session_fallback_stability_override(Some(true));
+        finalize_gemini_contents_thinking(&mut contents, true);
+        set_historical_session_fallback_stability_override(None);
+
+        assert_eq!(
+            v2c_fr_sig(&contents[1], "call_v2c_auth").as_deref(),
+            Some(V2A_STORE_SIG_A),
+            "authoritative unmarked functionResponse must not be downgraded"
+        );
     }
 }

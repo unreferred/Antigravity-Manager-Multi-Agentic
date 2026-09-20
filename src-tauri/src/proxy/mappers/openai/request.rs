@@ -551,6 +551,13 @@ pub fn transform_openai_request_with_session(
     let v2b_stability =
         crate::proxy::thinking_store::historical_session_fallback_stability_enabled();
     let recent_message_window = 24usize;
+    // [D4] Per-build thought-slot counter. The `contents` iterator is built in
+    // final builder order, so this counter is the ordinal of every model-role
+    // thought part actually pushed. The final-body scan reconciles this ordinal
+    // to the serialized content_index/part_index. The inbound pipeline may
+    // later demote/drop thoughts, which shifts ordinals; see the diagnostics
+    // module for the documented limitation.
+    let thought_slot_counter: std::cell::Cell<usize> = std::cell::Cell::new(0);
     let contents: Vec<Value> = request
         .messages
         .iter()
@@ -645,6 +652,44 @@ pub fn transform_openai_request_with_session(
                     });
                     if thought_fallback_marked {
                         thought_part[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
+                    }
+                    // [D4] OBSERVABILITY ONLY: attribute the builder-selected source
+                    // for this thought part by its builder ordinal. No-op when
+                    // diagnostics are disabled.
+                    if crate::proxy::signature_source_diagnostics::is_enabled() {
+                        use crate::proxy::signature_source_diagnostics::SigSource;
+                        let source = if thought_fallback_marked {
+                            SigSource::SessionFallback
+                        } else if effective_sig == crate::proxy::thinking_store::SENTINEL_SIGNATURE {
+                            SigSource::Sentinel
+                        } else if is_responses_api {
+                            SigSource::TrustedClient
+                        } else {
+                            // Chat protocol with a session-latest REAL and ownership
+                            // off: still a fallback-derived signature.
+                            SigSource::SessionFallback
+                        };
+                        let slot = thought_slot_counter.get();
+                        // `used_sig_fallback` mirrors the functionCall attribution
+                        // rule: a session-latest fallback value is "marked" whenever
+                        // ownership is on, independent of the V2B stability flag.
+                        let thought_fallback_used =
+                            thought_fallback_marked || used_sig_fallback;
+                        crate::proxy::signature_source_diagnostics::record_builder_thought(
+                            slot,
+                            source,
+                            thought_fallback_used,
+                            Some(
+                                crate::proxy::signature_source_diagnostics::thought_fingerprint_hash(
+                                    &effective_sig,
+                                ),
+                            ),
+                        );
+                        crate::proxy::signature_source_diagnostics::set_thought_session_message_count(
+                            slot,
+                            message_count,
+                        );
+                        thought_slot_counter.set(slot + 1);
                     }
                     parts.push(thought_part);
                 } else if let Some(rc) = client_reasoning {
@@ -997,19 +1042,46 @@ pub fn transform_openai_request_with_session(
                        "id": msg.tool_call_id.clone().unwrap_or_default()
                     }
                 });
-                if actual_include_thinking {
+                {
+                    use crate::proxy::signature_source_diagnostics::SigSource;
                     let mut effective_fr_sig = None;
-                    if let Some(ref call_id) = msg.tool_call_id {
-                        effective_fr_sig = crate::proxy::SignatureCache::global().get_tool_signature(call_id);
+                    let mut fr_source = SigSource::None;
+                    let mut fr_fallback_marked = false;
+                    if actual_include_thinking {
+                        if let Some(ref call_id) = msg.tool_call_id {
+                            effective_fr_sig = crate::proxy::SignatureCache::global().get_tool_signature(call_id);
+                            if effective_fr_sig.is_some() {
+                                fr_source = SigSource::ToolCache;
+                            }
+                        }
+                        if effective_fr_sig.is_none() {
+                            effective_fr_sig = thought_sig.clone();
+                            if effective_fr_sig.is_some() {
+                                fr_source = SigSource::SessionFallback;
+                                // [V2C] Mark only session-latest fallback functionResponses
+                                // so finalize can stabilize historical unresolved ones.
+                                if v2b_stability && sig_ownership {
+                                    fr_fallback_marked = true;
+                                }
+                            }
+                        }
+                        if effective_fr_sig.is_none() {
+                            effective_fr_sig = Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE.to_string());
+                            fr_source = SigSource::Sentinel;
+                        }
+                        if let Some(sig) = effective_fr_sig {
+                            fr_part["thoughtSignature"] = json!(sig);
+                        }
+                        if fr_fallback_marked {
+                            fr_part[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
+                        }
                     }
-                    if effective_fr_sig.is_none() {
-                        effective_fr_sig = thought_sig.clone();
-                    }
-                    if effective_fr_sig.is_none() {
-                        effective_fr_sig = Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE.to_string());
-                    }
-                    if let Some(sig) = effective_fr_sig {
-                        fr_part["thoughtSignature"] = json!(sig);
+                    if let Some(call_id) = msg.tool_call_id.as_deref() {
+                        crate::proxy::signature_source_diagnostics::record_builder_function_response(
+                            call_id,
+                            fr_source,
+                            fr_fallback_marked,
+                        );
                     }
                 }
                 parts.push(fr_part);
@@ -3983,7 +4055,7 @@ mod tests {
 
     use crate::proxy::cache_diagnostics::short_hash as d3_short_hash;
     use crate::proxy::signature_source_diagnostics::{
-        self as d3, observations_for_body, RestorePhase, SigSource,
+        self as d3, observations_for_body, PartKind, RestorePhase, SigSource,
     };
 
     fn d3_enable() {
@@ -4008,6 +4080,29 @@ mod tests {
         observations_for_body(body)
             .into_iter()
             .find(|o| o.tool_id_hash == want)
+    }
+
+    /// [V2C] Find the functionResponse observation for a raw tool id.
+    fn d3_fr_obs(
+        body: &Value,
+        call_id: &str,
+    ) -> Option<crate::proxy::signature_source_diagnostics::SigSourceObservation> {
+        let want = d3_tool_hash(call_id);
+        observations_for_body(body)
+            .into_iter()
+            .find(|o| o.tool_id_hash == want && o.entry.part_kind == PartKind::FunctionResponse)
+    }
+
+    /// Recursively detect the internal fallback marker anywhere in a body.
+    fn body_has_sig_fallback_marker(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(crate::proxy::thinking_store::SIG_FALLBACK_MARKER)
+                    || map.values().any(body_has_sig_fallback_marker)
+            }
+            Value::Array(arr) => arr.iter().any(body_has_sig_fallback_marker),
+            _ => false,
+        }
     }
 
     fn d3_lines(body: &Value) -> Vec<String> {
@@ -4247,7 +4342,16 @@ mod tests {
         let lines = d3_lines(&body);
         assert!(!lines.is_empty());
         for line in &lines {
+            // [D4] Raw tool id must not leak from ANY line, including thought
+            // lines (which carry no tool id at all).
             assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
+        }
+        // Tool-bearing observations still report the salted tool id hash, as
+        // before D4. Thought observations carry tool_id_hash=none by design.
+        for line in lines
+            .iter()
+            .filter(|l| l.contains("part_kind=functionCall") || l.contains("part_kind=functionResponse"))
+        {
             assert!(line.contains(&d3_tool_hash(&call_id)));
         }
         d3_cleanup();
@@ -4742,6 +4846,951 @@ mod tests {
             "diag line must report the V2B action: {line}"
         );
         assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
+        d3_cleanup();
+    }
+
+    // ==================================================================
+    // [V2C] Historical functionResponse signature stability
+    // ==================================================================
+
+    fn v2c_function_response_sig(body: &Value, call_id: &str) -> Option<String> {
+        function_response_parts(body)
+            .into_iter()
+            .find(|p| p["functionResponse"]["id"].as_str() == Some(call_id))
+            .and_then(|p| p["thoughtSignature"].as_str().map(str::to_string))
+    }
+
+    #[test]
+    fn v2c_1_historical_function_response_stabilized_and_byte_stable() {
+        let call_id = format!("call_v2c1_{}", uuid::Uuid::new_v4());
+        let session_a = v2a_unique_key("v2c1-a");
+        let session_b = v2a_unique_key("v2c1-b");
+        v2a_cache_session_sig(&session_a, V2A_SIG_A);
+        v2a_cache_session_sig(&session_b, V2A_SIG_B);
+        let req_a = v2b_historical_request(&session_a, &call_id);
+        let req_b = v2b_historical_request(&session_b, &call_id);
+
+        // V2B OFF baseline: the historical functionResponse rides session-latest,
+        // so it mutates A -> B across otherwise append-only requests.
+        let off_a = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req_a, "proj", "gemini-3-pro", None).0
+            })
+        });
+        let off_b = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req_b, "proj", "gemini-3-pro", None).0
+            })
+        });
+        assert_eq!(
+            v2c_function_response_sig(&off_a, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "without V2C the historical functionResponse must fall back to session A"
+        );
+        assert_eq!(
+            v2c_function_response_sig(&off_b, &call_id).as_deref(),
+            Some(V2A_SIG_B),
+            "without V2C the historical functionResponse must fall back to session B"
+        );
+
+        // V2C ON: the unresolved historical functionResponse is stabilized and
+        // its bytes are identical regardless of the session-latest value.
+        let body_a = v2b_transform_historical(&req_a);
+        let body_b = v2b_transform_historical(&req_b);
+        let fr_a = function_response_part_by_id(&body_a, &call_id);
+        let fr_b = function_response_part_by_id(&body_b, &call_id);
+        assert_eq!(
+            fr_a["thoughtSignature"].as_str(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "historical functionResponse session fallback must be stabilized"
+        );
+        assert_eq!(
+            serde_json::to_string(&fr_a).unwrap(),
+            serde_json::to_string(&fr_b).unwrap(),
+            "historical functionResponse bytes must not change when session-latest advances"
+        );
+    }
+
+    #[test]
+    fn v2c_2_tool_cache_real_function_response_never_sentinel() {
+        let session = v2a_unique_key("v2c2");
+        let call_id = format!("call_v2c2_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "tool-cache REAL is authoritative and must never be sentinel"
+        );
+        assert_ne!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE)
+        );
+    }
+
+    #[test]
+    fn v2c_3_live_trailing_function_response_unchanged() {
+        let session = v2a_unique_key("v2c3");
+        let call_id = format!("call_v2c3_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        // No model turn follows the tool result: the functionResponse is the
+        // trailing/live slot and must not be stabilized.
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "live/trailing functionResponse session fallback must stay REAL"
+        );
+    }
+
+    #[test]
+    fn v2c_4_flag_off_legacy_function_response() {
+        let session = v2a_unique_key("v2c4");
+        let call_id = format!("call_v2c4_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+
+        assert_eq!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "V2C off must preserve the legacy session-fallback REAL"
+        );
+    }
+
+    #[test]
+    fn v2c_5_signature_ownership_off_inert() {
+        let session = v2a_unique_key("v2c5");
+        let call_id = format!("call_v2c5_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = with_signature_ownership(false, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+
+        assert_eq!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "V2C must be inert when signature ownership is off"
+        );
+        assert!(
+            !body_has_sig_fallback_marker(&body),
+            "no internal marker may be emitted when ownership is off"
+        );
+    }
+
+    #[test]
+    fn v2c_6_no_fallback_marker_property_in_final_body() {
+        let session = v2a_unique_key("v2c6");
+        let call_id = format!("call_v2c6_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        assert!(
+            !body_has_sig_fallback_marker(&body),
+            "zero SIG_FALLBACK_MARKER properties may survive final serialization"
+        );
+    }
+
+    #[test]
+    fn v2c_7_d3_exact_function_response_attribution() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2c7");
+        let call_id = format!("call_v2c7_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        let obs = d3_fr_obs(&body, &call_id).expect("functionResponse observation present");
+        assert_eq!(obs.entry.source, SigSource::SessionFallback);
+        assert!(obs.entry.fallback_marked);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::None);
+        assert_eq!(obs.entry.session_lookup, "LATEST");
+        assert_eq!(
+            obs.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel
+        );
+        // The functionResponse at contents[2].parts[0] must be the observation.
+        let id_at = body["request"]["contents"][obs.content_index]["parts"][obs.part_index]
+            ["functionResponse"]["id"]
+            .as_str()
+            .expect("final body has functionResponse id at reported index");
+        assert_eq!(id_at, call_id);
+
+        let line = d3::format_line(&obs, "d3_traj", 42);
+        assert!(
+            line.contains("part_kind=functionResponse"),
+            "diag line must report the functionResponse part kind: {line}"
+        );
+        assert!(line.contains("v2b_action=STABILIZED_TO_SENTINEL"));
+        assert!(
+            !line.contains(&call_id),
+            "raw tool id must not leak: {line}"
+        );
+        assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2c_8_diagnostics_on_off_bytes_identical() {
+        let _d3_lock = d3::test_lock();
+        let session = v2a_unique_key("v2c8");
+        let call_id = format!("call_v2c8_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+
+        d3::reset_for_tests();
+        d3::set_enabled_for_tests(false);
+        let body_off = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+
+        d3::set_enabled_for_tests(true);
+        let body_on = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        assert!(
+            d3_fr_obs(&body_on, &call_id).is_some(),
+            "functionResponse must be attributed when diagnostics are on"
+        );
+
+        let mut a = body_off.clone();
+        let mut b = body_on.clone();
+        a["requestId"] = json!("v2c-fixed-request-id");
+        b["requestId"] = json!("v2c-fixed-request-id");
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "serialized request body must be byte-identical with diagnostics off vs on"
+        );
+        d3_cleanup();
+    }
+
+    // ==================================================================
+    // [D4] thought signature source diagnostics suite
+    // ==================================================================
+
+    /// All thought observations in the final body, in scan order.
+    fn d4_thought_obs(
+        body: &Value,
+    ) -> Vec<crate::proxy::signature_source_diagnostics::SigSourceObservation> {
+        observations_for_body(body)
+            .into_iter()
+            .filter(|o| o.entry.part_kind == PartKind::Thought)
+            .collect()
+    }
+
+    /// The first thought observation, if any.
+    fn d4_first_thought(
+        body: &Value,
+    ) -> Option<crate::proxy::signature_source_diagnostics::SigSourceObservation> {
+        d4_thought_obs(body).into_iter().next()
+    }
+
+    #[test]
+    fn d4_1_chat_historical_thought_session_fallback_latest() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_1");
+        let call_id = format!("call_d4_1_{}", uuid::Uuid::new_v4());
+        // Session-latest REAL, but no authoritative per-turn record exists.
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.part_kind, PartKind::Thought);
+        assert_eq!(t.entry.source, SigSource::SessionFallback);
+        assert!(t.entry.fallback_marked);
+        assert_eq!(t.entry.session_lookup, "LATEST");
+        assert_eq!(t.entry.session_message_count, Some(3));
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_2_thinking_store_authoritative_restore() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_2");
+        let call_id = format!("call_d4_2_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought d4_2");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.part_kind, PartKind::Thought);
+        assert_eq!(t.entry.source, SigSource::PerTurnStore);
+        assert_eq!(t.entry.restore_phase, RestorePhase::P1ToolId);
+        assert!(
+            t.entry.store_record_hash.as_deref().is_some_and(|h| h != "none"),
+            "restore must report a store_record_hash"
+        );
+        assert_eq!(t.entry.store_record_hash.as_deref().map(str::len), Some(16));
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_3_trusted_responses_thought() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_3");
+        // A text-only historical assistant turn: the Responses protocol trusts
+        // the client's own per-turn thought signature. No tool call is present,
+        // so no ThinkingStore record can shadow the trusted attribution.
+        let visible = "the historical answer d4_3";
+        let mut req = v2a_text_request(&session, visible, "client reasoning d4_3");
+        req.messages[1].signature = Some(V2A_SIG_A.to_string());
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            transform_openai_request_with_session(
+                &req,
+                "proj",
+                "gemini-3-pro",
+                None,
+                &session,
+                Some(&session),
+                true,
+            )
+        });
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.part_kind, PartKind::Thought);
+        assert_eq!(t.entry.source, SigSource::TrustedClient);
+        assert!(!t.entry.fallback_marked);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_4_sentinel_thought() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_4");
+        let call_id = format!("call_d4_4_{}", uuid::Uuid::new_v4());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.part_kind, PartKind::Thought);
+        assert_eq!(t.entry.source, SigSource::Sentinel);
+        assert!(!t.entry.fallback_marked);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_5_final_indices_point_at_real_thought() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_5");
+        let call_id = format!("call_d4_5_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let thoughts = d4_thought_obs(&body);
+        assert!(!thoughts.is_empty(), "at least one thought observation");
+        for t in &thoughts {
+            let part = &body["request"]["contents"][t.content_index]["parts"][t.part_index];
+            assert_eq!(
+                part.get("thought").and_then(|v| v.as_bool()),
+                Some(true),
+                "reported index must point at a thought==true part: {t:?}-> {part}"
+            );
+        }
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_6_function_call_and_response_attribution_unchanged() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_6");
+        let call_id = format!("call_d4_6_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        // functionCall still attributed.
+        let fc = d3_obs(&body, &call_id).expect("functionCall observation present");
+        assert_eq!(fc.entry.part_kind, PartKind::FunctionCall);
+        assert_eq!(fc.entry.source, SigSource::ToolCache);
+        assert_eq!(fc.thought_fingerprint_hash, None);
+        // functionResponse still attributed (V2C).
+        let fr = d3_fr_obs(&body, &call_id).expect("functionResponse observation present");
+        assert_eq!(fr.entry.part_kind, PartKind::FunctionResponse);
+        assert_eq!(fr.entry.source, SigSource::ToolCache);
+        assert_eq!(fr.thought_fingerprint_hash, None);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_7_no_raw_thought_text_or_signature_leaks() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_7");
+        let call_id = format!("call_d4_7_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let raw_thought = format!("D4_RAW_THOUGHT_SECRET_{}", uuid::Uuid::new_v4());
+        let req = v2a_tool_request(&session, &call_id, Some(&raw_thought));
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let lines = d3_lines(&body);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(!line.contains(&raw_thought), "raw thought text leaked: {line}");
+            assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
+            assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
+            assert!(
+                !line.contains(&d3_short_hash(&raw_thought)),
+                "derived raw-thought hash leaked: {line}"
+            );
+        }
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_8_diagnostics_on_off_bytes_identical() {
+        let _d3_lock = d3::test_lock();
+        let session = v2a_unique_key("d4_8");
+        let call_id = format!("call_d4_8_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_request(&session, &call_id);
+
+        d3::reset_for_tests();
+        d3::set_enabled_for_tests(false);
+        let body_off = v2b_transform_historical(&req);
+        assert!(d4_thought_obs(&body_off).is_empty());
+
+        d3::set_enabled_for_tests(true);
+        let body_on = v2b_transform_historical(&req);
+        assert!(!d4_thought_obs(&body_on).is_empty());
+
+        let mut a = body_off.clone();
+        let mut b = body_on.clone();
+        a["requestId"] = json!("d4-fixed-request-id");
+        b["requestId"] = json!("d4-fixed-request-id");
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "D4 must not alter serialized Gemini request bytes"
+        );
+        // No thought/functionCall/functionResponse signature, marker lifecycle,
+        // content ordering or part ordering changed.
+        for p in a["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+        {
+            assert!(
+                p.get("thought").and_then(|t| t.as_bool()) != Some(true)
+                    || p.get("thoughtSignature").is_some(),
+                "thought parts keep their signatures"
+            );
+        }
+        assert!(
+            !body_has_sig_fallback_marker(&a) && !body_has_sig_fallback_marker(&b),
+            "no SIG_FALLBACK_MARKER may survive"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_9_retention_bounded() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        for i in 0..300usize {
+            let key = format!("d4_retain_{i}");
+            {
+                let _guard = d3::begin_plan();
+                d3::record_builder_thought(0, SigSource::Sentinel, false, None);
+                d3::finish_plan(&json!({"requestId": key}));
+            }
+        }
+        assert!(
+            d3::registry_len_for_tests() <= 256,
+            "registry must stay bounded at MAX_RETAINED_PLANS"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d4_10_thought_stabilizer_action_reflects_real_behavior() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d4_10");
+        let call_id = format!("call_d4_10_{}", uuid::Uuid::new_v4());
+        // Historical turn whose thought + functionCall ride the session-latest
+        // fallback and are marked for V2B stability.
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        let t = d4_first_thought(&body).expect("thought observation present");
+        // [V2D] A historical thought whose provenance is still the unresolved
+        // session fallback is now stabilized by the stabilizer itself (not merely
+        // by finalize's fallback branch), so its own v2b_action is reported.
+        // OBSERVED BEHAVIOR (this test asserts it, it does not create it): the
+        // thought ends on the compatibility sentinel and reports
+        // STABILIZED_TO_SENTINEL. No new stabilization behavior flag is added.
+        let part = &body["request"]["contents"][t.content_index]["parts"][t.part_index];
+        assert_eq!(
+            part.get("thoughtSignature").and_then(|s| s.as_str()),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "thought still ends up with the compatibility sentinel"
+        );
+        assert_eq!(
+            t.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
+            "the V2D stabilizer neutralizes the unresolved historical fallback thought"
+        );
+        // The sibling functionCall, which did carry the REAL, is stabilized.
+        let fc = d3_obs(&body, &call_id).expect("functionCall observation present");
+        assert_eq!(
+            fc.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
+            "the marker-bearing functionCall REAL is stabilized"
+        );
+        d3_cleanup();
+    }
+
+    // ==================================================================
+    // [V2D] Historical thought session-fallback stability suite
+    // ==================================================================
+
+    /// Recursively detect the internal V2D stabilization tag anywhere in a body.
+    fn body_has_v2d_marker(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(crate::proxy::thinking_store::V2D_STABILIZED_THOUGHT_MARKER)
+                    || map.values().any(body_has_v2d_marker)
+            }
+            Value::Array(arr) => arr.iter().any(body_has_v2d_marker),
+            _ => false,
+        }
+    }
+
+    /// Final serialized `thoughtSignature` of the first thought part, if any.
+    fn v2d_first_thought_sig(body: &Value) -> Option<String> {
+        let contents = body["request"]["contents"].as_array()?;
+        for content in contents {
+            for part in content["parts"].as_array()? {
+                if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                    return part["thoughtSignature"].as_str().map(str::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn v2d_1_historical_thought_session_fallback_becomes_sentinel() {
+        let session = v2a_unique_key("v2d1");
+        let call_id = format!("call_v2d1_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        assert_eq!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "historical unresolved fallback thought must be stabilized to the sentinel"
+        );
+    }
+
+    #[test]
+    fn v2d_2_finalize_cannot_resurrect_historical_fallback_thought() {
+        // The historical turn's functionCall carries an authoritative-looking
+        // REAL, but the historical thought itself is an unresolved fallback. V2D
+        // must win: finalize's sibling-REAL alignment must not copy the sibling
+        // REAL back onto the stabilized thought.
+        let session = v2a_unique_key("v2d2");
+        let call_id = format!("call_v2d2_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        let thought_sig = v2d_first_thought_sig(&body);
+        assert_eq!(
+            thought_sig.as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "a sibling functionCall REAL must not resurrect the stabilized thought"
+        );
+        assert_ne!(
+            thought_sig.as_deref(),
+            Some(V2A_SIG_A),
+            "the historical thought must not inherit the sibling tool-cache REAL"
+        );
+    }
+
+    #[test]
+    fn v2d_3_per_turn_store_p1_authoritative_thought_remains_real() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2d3");
+        let call_id = format!("call_v2d3_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative per-turn thought v2d3");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.source, SigSource::PerTurnStore);
+        assert_eq!(t.entry.restore_phase, RestorePhase::P1ToolId);
+        assert_eq!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(V2A_SIG_A),
+            "an authoritative PER_TURN_STORE/P1 historical thought must stay REAL"
+        );
+        assert_eq!(
+            t.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::None,
+            "an authoritative restored thought must not be stabilized"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2d_4_ownership_pinned_authoritative_thought_remains_real() {
+        // Same shape as V2D-3 but via a text (fingerprint) restore, exercising
+        // ownership-pinned restoration rather than the tool-id phase.
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2d4");
+        let visible = "the authoritative answer v2d4";
+        v2a_seed_text_record(&session, V2A_SIG_A, "authoritative thought v2d4", visible);
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_text_request(&session, visible, "client reasoning v2d4");
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.source, SigSource::PerTurnStore);
+        assert_eq!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(V2A_SIG_A),
+            "ownership-pinned authoritative restored thought must stay REAL"
+        );
+        assert_eq!(
+            t.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::None,
+            "ownership-pinned authoritative thought must not be stabilized"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2d_5_live_thought_session_fallback_not_neutralized() {
+        // Single-turn (live) request: the last model turn keeps its session-latest
+        // fallback REAL; V2D is historical-only.
+        let session = v2a_unique_key("v2d5");
+        let call_id = format!("call_v2d5_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2a_tool_request(&session, &call_id, Some("live reasoning v2d5"));
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        assert_eq!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(V2A_SIG_A),
+            "the live/last model turn thought fallback must NOT be neutralized"
+        );
+    }
+
+    #[test]
+    fn v2d_6_responses_trusted_per_turn_thought_real_unchanged() {
+        let session = v2a_unique_key("v2d6");
+        let visible = "the historical answer v2d6";
+        let mut req = v2a_text_request(&session, visible, "client reasoning v2d6");
+        req.messages[1].signature = Some(V2A_SIG_A.to_string());
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request_with_session(
+                    &req,
+                    "proj",
+                    "gemini-3-pro",
+                    None,
+                    &session,
+                    Some(&session),
+                    true,
+                )
+            })
+        });
+        assert_eq!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(V2A_SIG_A),
+            "trusted Responses per-turn REAL must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn v2d_7_feature_flag_off_preserves_pre_v2d_behavior() {
+        // V2B/V2D OFF: the historical Chat thought fallback must not be
+        // neutralized by the stabilizer.
+        let session = v2a_unique_key("v2d7");
+        let call_id = format!("call_v2d7_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        assert_ne!(
+            v2d_first_thought_sig(&body).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "V2D off must preserve the pre-V2D thought fallback behavior"
+        );
+    }
+
+    #[test]
+    fn v2d_8_v2b_function_call_behavior_unchanged() {
+        let session = v2a_unique_key("v2d8");
+        let call_id = format!("call_v2d8_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "V2B historical functionCall stabilization must be unchanged"
+        );
+    }
+
+    #[test]
+    fn v2d_9_v2c_function_response_behavior_unchanged() {
+        let session = v2a_unique_key("v2d9");
+        let call_id = format!("call_v2d9_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        assert_eq!(
+            v2c_function_response_sig(&body, &call_id).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "V2C historical functionResponse stabilization must be unchanged"
+        );
+    }
+
+    #[test]
+    fn v2d_10_d4_attribution_for_stabilized_thought() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2d10");
+        let call_id = format!("call_v2d10_{}", uuid::Uuid::new_v4());
+        // Historical turn whose thought rides the session-latest fallback.
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        let t = d4_first_thought(&body).expect("thought observation present");
+        assert_eq!(t.entry.part_kind, PartKind::Thought);
+        assert_eq!(t.entry.source, SigSource::SessionFallback);
+        assert!(t.entry.fallback_marked);
+        assert_eq!(t.entry.restore_phase, RestorePhase::None);
+        assert_eq!(t.entry.session_lookup, "LATEST");
+        assert_eq!(
+            t.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
+            "stabilized thought must report STABILIZED_TO_SENTINEL"
+        );
+        let line = d3::format_line(&t, "v2d_traj", 7);
+        assert!(
+            line.contains("v2b_action=STABILIZED_TO_SENTINEL"),
+            "diagnostic line must report the action: {line}"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2d_11_no_internal_markers_survive_serialization() {
+        let session = v2a_unique_key("v2d11");
+        let call_id = format!("call_v2d11_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+        assert!(
+            !body_has_sig_fallback_marker(&body),
+            "no SIG_FALLBACK_MARKER may survive final serialization"
+        );
+        assert!(
+            !body_has_v2d_marker(&body),
+            "no V2D stabilization marker may survive final serialization"
+        );
+    }
+
+    #[test]
+    fn v2d_12_diagnostics_on_off_bytes_identical() {
+        let _d3_lock = d3::test_lock();
+        let session = v2a_unique_key("v2d12");
+        let call_id = format!("call_v2d12_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+
+        d3::reset_for_tests();
+        d3::set_enabled_for_tests(false);
+        let body_off = v2b_transform_historical(&req);
+
+        d3::set_enabled_for_tests(true);
+        let body_on = v2b_transform_historical(&req);
+        assert!(
+            d4_first_thought(&body_on).is_some(),
+            "thought must be attributed when diagnostics are on"
+        );
+
+        let mut a = body_off.clone();
+        let mut b = body_on.clone();
+        a["requestId"] = json!("v2d-fixed-request-id");
+        b["requestId"] = json!("v2d-fixed-request-id");
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "V2D must not alter serialized Gemini request bytes"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2d_13_append_only_history_content_preserving() {
+        // Every non-thought part and all visible text must be byte-identical
+        // between V2D off and on; only the historical thought signature may
+        // change (to the sentinel).
+        let session = v2a_unique_key("v2d13");
+        let call_id = format!("call_v2d13_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let req = v2b_historical_request(&session, &call_id);
+
+        let off = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        let on = v2b_transform_historical(&req);
+
+        let strip_sigs = |body: &Value| -> Value {
+            let mut b = body.clone();
+            for content in b["request"]["contents"].as_array_mut().unwrap() {
+                for part in content["parts"].as_array_mut().unwrap() {
+                    part.as_object_mut().unwrap().remove("thoughtSignature");
+                }
+            }
+            b
+        };
+        let mut off_stripped = strip_sigs(&off);
+        let mut on_stripped = strip_sigs(&on);
+        off_stripped["requestId"] = json!("v2d13-fixed");
+        on_stripped["requestId"] = json!("v2d13-fixed");
+        assert_eq!(
+            serde_json::to_vec(&off_stripped).unwrap(),
+            serde_json::to_vec(&on_stripped).unwrap(),
+            "append-only history content must be preserved except for signature stabilization"
+        );
+    }
+
+    #[test]
+    fn v2d_14_no_raw_thought_signature_or_tool_data_in_diagnostics() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2d14");
+        let call_id = format!("call_v2d14_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+        let raw_thought = format!("V2D_RAW_THOUGHT_SECRET_{}", uuid::Uuid::new_v4());
+        let req = v2a_tool_request(&session, &call_id, Some(&raw_thought));
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+        let lines = d3_lines(&body);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(!line.contains(&raw_thought), "raw thought text leaked: {line}");
+            assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
+            assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
+            assert!(
+                !line.contains(&d3_short_hash(&raw_thought)),
+                "derived raw-thought hash leaked: {line}"
+            );
+        }
+        assert!(
+            !body_has_v2d_marker(&body),
+            "internal V2D marker must never reach the serialized body"
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn v2d_15_multiple_historical_thoughts_only_fallback_slots_neutralized() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2d15");
+        let call_a = format!("call_v2d15a_{}", uuid::Uuid::new_v4());
+        let call_b = format!("call_v2d15b_{}", uuid::Uuid::new_v4());
+        // Call A resolves to an authoritative tool-cache REAL; call B is an
+        // unresolved session-latest fallback (V2B-8 shape).
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_a, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2b_historical_parallel_request(&session, &call_a, &call_b);
+        let body = v2b_transform_historical(&req);
+
+        // Authoritative call A keeps its REAL; unresolved call B is stabilized.
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_a).as_deref(),
+            Some(V2A_SIG_A),
+            "authoritative parallel call A must keep its REAL"
+        );
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_b).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "unresolved parallel call B fallback must be stabilized"
+        );
+
+        // No mutable session fallback REAL may survive anywhere in the body.
+        let all_sigs: Vec<String> = body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .filter_map(|p| p["thoughtSignature"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !all_sigs.iter().any(|s| s == V2A_SIG_B),
+            "no mutable session fallback REAL may survive: {all_sigs:?}"
+        );
         d3_cleanup();
     }
 }
