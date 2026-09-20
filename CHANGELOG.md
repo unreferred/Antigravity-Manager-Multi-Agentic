@@ -3,6 +3,30 @@
 > 完整版本历史记录。返回项目主页请查看 [README.md](README.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **Unreleased (Fork: Multi-Agentic)**:
+        -   **[多智能体协议兼容性加固] 修复协议转换时运行时工具调用参数与执行结果被误当做 Schema 清洗的缺陷**:
+            -   **数据与 Schema 严格解耦**: 运行时 `functionCall.args` 与 `functionResponse`（`response`/`result`）负载明确作为不透明的运行时数据（DATA）处理，协议转接至 Gemini 时不再错误视作 JSON Schema 触发清洗逻辑。
+            -   **保留含 Schema 敏感关键字的参数**: 彻底修复运行时工具参数中包含类似 schema 字段名（如 `description`、`type`、`properties`、`title`、`required` 等）时被清洗剥离的缺陷。
+            -   **根治多智能体历史上下文损坏**: 彻底根治在 OpenAI 兼容协议向 Gemini 历史重构过程中，Kilo Code 等智能体所发出的合法 `{description, prompt, subagent_type}` 调用参数被错误裁剪为 `{description}` 的恶性上下文截断问题。
+            -   **通用协议修复**: 修复方案为通用协议层防护，不针对 Kilo 或 `task` 工具进行任何特例硬编码处理。
+            -   **回归测试用例**:
+                -   新增运行时数据负载完整性保留回归测试（`test_regression_task_functioncall_args_survive_cleaning`, `test_regression_generic_runtime_payload_with_schema_keys_survives`）。
+                -   新增真实工具定义 JSON Schema 正常清洗对照测试（`test_control_genuine_tool_schema_still_sanitized`）。
+                -   新增历史单任务调用参数保留回归测试（`regression_d_single_recent_task_call_keeps_all_args`）。
+                -   新增并行多任务分发调用参数保留回归测试（`regression_e_five_parallel_task_calls_keep_all_args`）。
+            -   **真实环境压力验证**:
+                -   已完整通过 4 轮真实 Kilo Code 多智能体极限压力测试，共计 19 次专业子智能体分发调用均全部成功完成。
+                -   并行任务分发与多次 parent -> subagent -> parent 连续交互链路全绿通过。
+                -   完整测试周期内 0 畸变 `task` 调用、0 丢失 `prompt` 或 `subagent_type`、0 服务端/代理错误。
+            -   **贡献者**: unreferred
+            -   **排查中 (Under investigation)**:
+                -   长会话智能体运行下的 Gemini 缓存输入/前缀复用 (cached-input/prefix reuse)。
+                -   部分轨迹中偶发的 `functionCall`/`functionResponse` 配对计数不一致。
+            -   **未来规划 (Planned)**:
+                -   多智能体可观测性 (Multi-agent observability)。
+                -   Gemini 缓存/前缀复用优化 (Gemini cache/prefix optimization)。
+                -   UI 现代化改造 (UI modernization)。
+                -   全局国际化与本地化一致性 (Consistent localization/i18n)。
     *   **v4.7.6 (2026-09-18)**:
         -   **[对齐官方 IDE 订阅判定与权威解析] 彻底重构订阅解析链路，根治免费账号误判 PRO (PR #3470, Fixes #3469)**:
             -   **对齐官方机器字段 `paidTier.id`**: 订阅等级提取全面改由机器可读的唯一权威字段 `id`（`free-tier` / `g1-pro-tier` / `g1-ultra-tier`）优先驱动，摒弃易受语言环境干扰的自由文本 `name`，精准收敛识别 Ultra 内部代号 `helium` 与免费代号 `starter`。

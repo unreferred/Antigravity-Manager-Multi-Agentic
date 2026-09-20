@@ -3,6 +3,30 @@
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
 *   **Version History**:
+    *   **Unreleased (Fork: Multi-Agentic)**:
+        -   **[Multi-Agentic Protocol Compatibility] Preserve Runtime Tool Call Arguments and Execution Payloads During Protocol Translation**:
+            -   **Runtime Payload vs Schema Distinction**: Runtime `functionCall.args` and `functionResponse` (`response`/`result`) payloads are now strictly treated as opaque runtime DATA rather than JSON Schema definitions during OpenAI-compatible to Gemini protocol translation.
+            -   **Preserve Schema-Like Argument Keys**: Fixed loss of runtime tool arguments containing schema-like field names (such as `description`, `type`, `properties`, `title`, `required`) during recursive sanitization.
+            -   **Fix Multi-Agent History Corruption**: Fixed Kilo Code multi-agent history corruption where valid `{description, prompt, subagent_type}` payloads could collapse into `{description}` during OpenAI-compatible -> Gemini history reconstruction.
+            -   **Generic Fix**: Protocol fix is fully generic across all tool names and content parts; it does not special-case Kilo or the `task` tool.
+            -   **Regression Test Suite**:
+                -   Added regression coverage for runtime payload preservation (`test_regression_task_functioncall_args_survive_cleaning`, `test_regression_generic_runtime_payload_with_schema_keys_survives`).
+                -   Added genuine-schema sanitization control coverage (`test_control_genuine_tool_schema_still_sanitized`).
+                -   Added historical single task-call preservation coverage (`regression_d_single_recent_task_call_keeps_all_args`).
+                -   Added parallel task-call preservation coverage (`regression_e_five_parallel_task_calls_keep_all_args`).
+            -   **Validation**:
+                -   Successfully completed a four-wave real Kilo Code multi-agent stress test with 19 delegated subagents.
+                -   Parallel task delegation and repeated parent -> subagent -> parent continuation passed across all waves.
+                -   Zero malformed `task` calls, zero missing `prompt` or `subagent_type`, and zero provider errors observed during the completed stress test.
+            -   **Contributor**: unreferred
+            -   **Under Investigation**:
+                -   Gemini cached-input/prefix reuse in long-running agentic sessions.
+                -   `functionCall`/`functionResponse` pairing mismatch observed in some trajectories.
+            -   **Planned**:
+                -   Multi-agent observability.
+                -   Gemini cache/prefix optimization.
+                -   UI modernization.
+                -   Consistent localization/i18n.
     *   **v4.7.6 (2026-09-18)**:
         -   **[Official IDE Subscription Alignment & Authoritative Parsing] Architectural Subscription Refactor to Fix Free Accounts Misidentified as PRO (PR #3470, Fixes #3469)**:
             -   **Align with Machine Identifier `paidTier.id`**: Tier extraction is now strictly prioritized by machine-readable `id` (`free-tier` / `g1-pro-tier` / `g1-ultra-tier`) rather than mutable text `name`, accurately handling internal codenames like `helium` (Ultra) and `starter` (Free).

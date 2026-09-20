@@ -2863,4 +2863,205 @@ mod tests {
             Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE)
         );
     }
+
+    fn task_tool_definition() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Spawn a subagent",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "subagent_type": {"type": "string"}
+                    },
+                    "required": ["description", "prompt", "subagent_type"]
+                }
+            }
+        })
+    }
+
+    fn task_call_arguments(description: &str, prompt: &str, subagent_type: &str) -> String {
+        serde_json::to_string(&json!({
+            "description": description,
+            "prompt": prompt,
+            "subagent_type": subagent_type,
+        }))
+        .expect("task args serialize")
+    }
+
+    fn model_function_call_parts(body: &Value) -> Vec<Value> {
+        body["request"]["contents"]
+            .as_array()
+            .expect("request.contents is array")
+            .iter()
+            .filter(|c| c["role"] == "model")
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .filter(|p| p.get("functionCall").is_some())
+            .collect()
+    }
+
+    #[test]
+    fn regression_d_single_recent_task_call_keeps_all_args() {
+        // Test D: one recent historical assistant `task` call, placed as the
+        // last message of a small (<24) list so it sits inside the recent
+        // window and the len>1000 truncation path cannot trigger. A `task`
+        // tool definition is present so the fix_tool_call_args path runs.
+        let description = "Explore auth flow";
+        let prompt = "Investigate how user authentication flows through the login handler, session middleware, and token refresh path. Summarize the entry points, key files, and edge cases so the follow-up implementation step can proceed without re-reading the codebase.";
+        let subagent_type = "Explore";
+        let req = OpenAIRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String(
+                        "Please investigate the auth flow.".to_string(),
+                    )),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_task_recent_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "task".to_string(),
+                            arguments: task_call_arguments(description, prompt, subagent_type),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ],
+            tools: Some(vec![task_tool_definition()]),
+            ..Default::default()
+        };
+
+        let (result, _, _, _) =
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
+        let parts = model_function_call_parts(&result);
+        assert_eq!(
+            parts.len(),
+            1,
+            "expected one functionCall part, got: {}",
+            result
+        );
+        let call = &parts[0]["functionCall"];
+        assert_eq!(call["name"], "task");
+        assert_eq!(call["id"], "call_task_recent_1");
+        let args = &call["args"];
+        assert_eq!(
+            args["description"], description,
+            "description lost: {}",
+            args
+        );
+        assert_eq!(args["prompt"], prompt, "prompt lost: {}", args);
+        assert_eq!(
+            args["subagent_type"], subagent_type,
+            "subagent_type lost: {}",
+            args
+        );
+    }
+
+    #[test]
+    fn regression_e_five_parallel_task_calls_keep_all_args() {
+        // Test E: five parallel `task` calls in ONE recent assistant message,
+        // each with distinct description/prompt/subagent_type and distinct ids.
+        let cases = vec![
+            (
+                "call_1",
+                "Explore auth flow",
+                "Trace the login handler, session middleware, and token refresh path end to end, noting entry points and edge cases in detail for the later implementation step.",
+                "Explore",
+            ),
+            (
+                "call_2",
+                "Plan database migration",
+                "Draft a step-by-step migration plan for moving user profile records to the new schema, covering ordering, backfill strategy, rollback criteria, and verification queries.",
+                "Plan",
+            ),
+            (
+                "call_3",
+                "Review payment webhook",
+                "Audit the payment webhook handler for signature verification gaps, retry safety, idempotency handling, and logging coverage, then list concrete findings with file references.",
+                "general-purpose",
+            ),
+            (
+                "call_4",
+                "Document cache layer",
+                "Read through the caching layer implementation and write thorough documentation of key namespaces, TTL policies, invalidation triggers, and failure fallbacks.",
+                "document-writer",
+            ),
+            (
+                "call_5",
+                "Fix flaky test suite",
+                "Reproduce the intermittent failures in the integration test suite, isolate ordering dependencies and timing assumptions, and propose minimal stabilizing fixes per failing case.",
+                "debugger",
+            ),
+        ];
+        let tool_calls: Vec<ToolCall> = cases
+            .iter()
+            .map(|(id, description, prompt, subagent_type)| ToolCall {
+                id: id.to_string(),
+                r#type: "function".to_string(),
+                function: Some(ToolFunction {
+                    name: "task".to_string(),
+                    arguments: task_call_arguments(description, prompt, subagent_type),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let req = OpenAIRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String(
+                        "Please fan out these five investigations in parallel.".to_string(),
+                    )),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(tool_calls),
+                    ..Default::default()
+                },
+            ],
+            tools: Some(vec![task_tool_definition()]),
+            ..Default::default()
+        };
+
+        let (result, _, _, _) =
+            transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
+        let parts = model_function_call_parts(&result);
+        assert_eq!(
+            parts.len(),
+            5,
+            "expected five functionCall parts, got: {}",
+            result
+        );
+        for (id, description, prompt, subagent_type) in &cases {
+            let part = parts
+                .iter()
+                .find(|p| p["functionCall"]["id"].as_str() == Some(*id))
+                .unwrap_or_else(|| panic!("missing functionCall id {} in: {}", id, result));
+            let call = &part["functionCall"];
+            assert_eq!(call["name"], "task");
+            let args = &call["args"];
+            assert_eq!(
+                args["description"], *description,
+                "description lost for {}: {}",
+                id, args
+            );
+            assert_eq!(args["prompt"], *prompt, "prompt lost for {}: {}", id, args);
+            assert_eq!(
+                args["subagent_type"], *subagent_type,
+                "subagent_type lost for {}: {}",
+                id, args
+            );
+        }
+    }
 }

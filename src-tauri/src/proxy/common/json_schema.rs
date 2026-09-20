@@ -119,9 +119,18 @@ fn collect_all_defs(value: &Value, defs: &mut serde_json::Map<String, Value>) {
             }
         }
         // 递归处理所有子节点
+        // 运行时负载 (functionCall.args / functionResponse.response|result) 为 DATA 非 schema:
+        // 仅当本层形如调用/结果对象时跳过，避免误伤名为 args/response/result 的 schema 属性。
+        let is_call_like = map.contains_key("functionCall")
+            || map.contains_key("functionResponse")
+            || map.contains_key("name")
+            || map.contains_key("id");
         for (key, v) in map {
             // 跳过 $defs/definitions 本身，避免重复处理
-            if key != "$defs" && key != "definitions" {
+            if key != "$defs"
+                && key != "definitions"
+                && !(is_call_like && (key == "args" || key == "response" || key == "result"))
+            {
                 collect_all_defs(v, defs);
             }
         }
@@ -180,8 +189,18 @@ fn flatten_refs(
         }
     }
 
-    // 遍历子节点
-    for (_, v) in map.iter_mut() {
+    // 遍历子节点 (跳过运行时负载: functionCall.args / functionResponse.response|result 均为不透明 DATA)
+    // 仅当该 map 本身形如调用/结果对象 (含 name/id 且含对应负载键) 时跳过，避免误伤 schema 定义。
+    let is_call_like = map.contains_key("name") || map.contains_key("id");
+    let skip_keys: &[&str] = if is_call_like {
+        &["args", "response", "result"]
+    } else {
+        &[]
+    };
+    for (k, v) in map.iter_mut() {
+        if skip_keys.contains(&k.as_str()) {
+            continue;
+        }
         if let Value::Object(child_map) = v {
             flatten_refs(child_map, defs, depth + 1);
         } else if let Value::Array(arr) = v {
@@ -206,6 +225,47 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
     match value {
         Value::Object(map) => {
+            // 0. [RUNTIME GUARD] Never sanitize runtime call/result payloads.
+            // `functionCall.args` and `functionResponse.response`/`result` are opaque
+            // runtime DATA, not tool-definition schemas: their keys (e.g. `description`,
+            // `type`, `properties`) must not trigger whitelist filtering or constraint
+            // migration. Wrapper fields (name/id/...) still recurse normally below, and
+            // every other subtree keeps byte-identical behavior. Generic over all tool
+            // names; array recursion reaches nested content-part lists automatically.
+            let has_runtime_call = map
+                .get("functionCall")
+                .map(|v| v.is_object())
+                .unwrap_or(false)
+                || map
+                    .get("functionResponse")
+                    .map(|v| v.is_object())
+                    .unwrap_or(false);
+            if has_runtime_call {
+                if let Some(Value::Object(fc_map)) = map.get_mut("functionCall") {
+                    for (k, v) in fc_map.iter_mut() {
+                        if k == "args" {
+                            continue;
+                        }
+                        clean_json_schema_recursive(v, false, depth + 1);
+                    }
+                }
+                if let Some(Value::Object(fr_map)) = map.get_mut("functionResponse") {
+                    for (k, v) in fr_map.iter_mut() {
+                        if k == "response" || k == "result" {
+                            continue;
+                        }
+                        clean_json_schema_recursive(v, false, depth + 1);
+                    }
+                }
+                for (k, v) in map.iter_mut() {
+                    if k == "functionCall" || k == "functionResponse" {
+                        continue;
+                    }
+                    clean_json_schema_recursive(v, false, depth + 1);
+                }
+                return false;
+            }
+
             // 0. [NEW] 合并 allOf
             merge_all_of(map);
 
@@ -1830,6 +1890,81 @@ mod tests {
         assert_eq!(
             schema["properties"]["query"]["properties"]["where"]["items"]["items"],
             json!({ "type": "string" })
+        );
+    }
+
+    #[test]
+    fn test_regression_task_functioncall_args_survive_cleaning() {
+        // Regression: clean_json_schema must not strip nested functionCall.args
+        // {description, prompt, subagent_type} down to {description}.
+        let mut payload = json!({
+            "functionCall": {
+                "name": "task",
+                "args": {
+                    "description": "Test task",
+                    "prompt": "Detailed instructions",
+                    "subagent_type": "explore"
+                },
+                "id": "call_test_1"
+            }
+        });
+
+        clean_json_schema(&mut payload);
+
+        let fc = &payload["functionCall"];
+        assert_eq!(fc["name"], "task");
+        assert_eq!(fc["id"], "call_test_1");
+        assert_eq!(fc["args"]["description"], "Test task");
+        assert_eq!(fc["args"]["prompt"], "Detailed instructions");
+        assert_eq!(fc["args"]["subagent_type"], "explore");
+    }
+
+    #[test]
+    fn test_regression_generic_runtime_payload_with_schema_keys_survives() {
+        // Regression: runtime payload whose args happen to contain
+        // schema-looking keys must remain DATA, unchanged.
+        let original = json!({
+            "functionCall": {
+                "name": "my_tool",
+                "args": {
+                    "description": "d",
+                    "title": "t",
+                    "type": "custom",
+                    "properties": {"a": "b"},
+                    "required": ["x"],
+                    "custom_field": "keep"
+                },
+                "id": "call_2"
+            }
+        });
+        let mut payload = original.clone();
+
+        clean_json_schema(&mut payload);
+
+        assert_eq!(
+            payload, original,
+            "runtime payload was mutated: {}",
+            payload
+        );
+    }
+
+    #[test]
+    fn test_control_genuine_tool_schema_still_sanitized() {
+        // Control: a genuine tool-definition schema must still be sanitized.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": false
+        });
+
+        clean_json_schema(&mut schema);
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["x"]["type"], "string");
+        assert!(
+            schema.get("additionalProperties").is_none(),
+            "additionalProperties should be removed: {}",
+            schema
         );
     }
 }
