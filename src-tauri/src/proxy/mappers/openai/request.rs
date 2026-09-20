@@ -134,6 +134,47 @@ fn collect_system_instruction_blocks(request: &OpenAIRequest) -> Vec<String> {
     blocks
 }
 
+/// Environment switch for V1 "append-only history".
+///
+/// Enabled (`ABV_APPEND_ONLY_HISTORY=1` or `true`) means historical
+/// `functionCall.args` and `functionResponse.response.result` are emitted in
+/// full and stay byte-stable as the conversation grows, so older tool payloads
+/// do not get rewritten merely because one more message was appended.
+///
+/// Disabled / unset keeps the legacy behavior: payloads older than
+/// `recent_message_window` messages are replaced by truncation sentinels.
+const APPEND_ONLY_HISTORY_ENV: &str = "ABV_APPEND_ONLY_HISTORY";
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_ONLY_HISTORY_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_append_only_history_override(value: Option<bool>) {
+    APPEND_ONLY_HISTORY_TEST_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// Parses the documented flag values: `1` / `true` enable append-only history;
+/// `0` / `false` / unset (and any other value) keep the legacy behavior.
+fn parse_append_only_history_flag(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
+}
+
+/// Returns the effective append-only-history mode. See [`APPEND_ONLY_HISTORY_ENV`].
+pub fn append_only_history_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = APPEND_ONLY_HISTORY_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+
+    parse_append_only_history_flag(std::env::var(APPEND_ONLY_HISTORY_ENV).ok().as_deref())
+}
+
 fn is_apply_patch_tool_name(name: &str) -> bool {
     name == "apply_patch" || name == "apply_patch_v2"
 }
@@ -257,6 +298,7 @@ pub fn transform_openai_request_with_session(
     signature_read_key: Option<&str>,
     is_responses_api: bool,
 ) -> (Value, String, usize, String) {
+    let _sig_plan_guard = crate::proxy::signature_source_diagnostics::begin_plan();
     let remember_cwd =
         |text: &str| crate::proxy::adapters::apply_patch_preflight::remember_cwd_from_text(text);
     let found_cwd = request.instructions.as_deref().is_some_and(remember_cwd);
@@ -497,6 +539,17 @@ pub fn transform_openai_request_with_session(
 
     // 2. 构建 Gemini contents (过滤掉 system/developer 指令)
     let total_messages = request.messages.len();
+    // [V1] Append-only history: only the legacy rollback path may truncate
+    // historical tool payloads by sliding-window age. See `append_only_history_enabled`.
+    let legacy_window_truncation = !append_only_history_enabled();
+    // [V2A] Historical signature ownership: distinguish a turn that already owns
+    // an authoritative per-turn REAL from one that only received a session-latest
+    // fallback. See `signature_ownership_enabled`.
+    let sig_ownership = crate::proxy::thinking_store::signature_ownership_enabled();
+    // [V2B] Historical session-fallback stability: mark fallback-derived parts so
+    // the finalize stage can stabilize only unresolved historical signatures.
+    let v2b_stability =
+        crate::proxy::thinking_store::historical_session_fallback_stability_enabled();
     let recent_message_window = 24usize;
     let contents: Vec<Value> = request
         .messages
@@ -505,6 +558,7 @@ pub fn transform_openai_request_with_session(
         .filter(|(_, msg)| msg.role != "system" && msg.role != "developer")
         .map(|(msg_index, msg)| {
             let is_latest = msg_index >= total_messages.saturating_sub(recent_message_window);
+            let truncate_historical = legacy_window_truncation && !is_latest;
             let role = match msg.role.as_str() {
                 "assistant" => "model",
                 "tool" | "function" => "user",
@@ -512,6 +566,10 @@ pub fn transform_openai_request_with_session(
             };
 
             let mut parts = Vec::new();
+            // V2A: true when some signature on this model turn came only from the
+            // session-latest fallback rather than from this turn's own authority.
+            let mut used_sig_fallback = false;
+            let mut thought_fallback_marked = false;
 
             let client_reasoning = msg
                 .reasoning_content
@@ -533,6 +591,10 @@ pub fn transform_openai_request_with_session(
                     };
 
                     // 签名处理：Responses 协议对齐 Anthropic 校验并采纳客户端合法签名；Chat 协议签名完全由服务端参与回填
+                    // [V2A] Precedence: authoritative per-turn REAL > trusted incoming
+                    // per-turn REAL (protocol policy) > session-latest REAL fallback >
+                    // sentinel. A session-latest fallback is marked so the inbound
+                    // ThinkingStore may still restore the turn's authoritative REAL.
                     let effective_sig = if is_responses_api {
                         let mut sig_opt = None;
                         if let Some(ref sig) = msg.signature {
@@ -552,18 +614,39 @@ pub fn transform_openai_request_with_session(
                         }
                         if sig_opt.is_none() {
                             sig_opt = thought_sig.clone();
+                            if sig_ownership && sig_opt.is_some() {
+                                used_sig_fallback = true;
+                            }
+                            if v2b_stability && sig_ownership && sig_opt.is_some() {
+                                thought_fallback_marked = true;
+                            }
                         }
                         sig_opt.unwrap_or_else(|| crate::proxy::thinking_store::SENTINEL_SIGNATURE.to_string())
                     } else {
                         // OpenAI Chat 协议：签名完全由服务端参与回填
-                        thought_sig.clone().unwrap_or_else(|| crate::proxy::thinking_store::SENTINEL_SIGNATURE.to_string())
+                        match thought_sig.clone() {
+                            Some(sig) => {
+                                if sig_ownership {
+                                    used_sig_fallback = true;
+                                }
+                                if v2b_stability && sig_ownership {
+                                    thought_fallback_marked = true;
+                                }
+                                sig
+                            }
+                            None => crate::proxy::thinking_store::SENTINEL_SIGNATURE.to_string(),
+                        }
                     };
 
-                    parts.push(json!({
+                    let mut thought_part = json!({
                         "text": thought_text,
                         "thought": true,
                         "thoughtSignature": effective_sig,
-                    }));
+                    });
+                    if thought_fallback_marked {
+                        thought_part[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
+                    }
+                    parts.push(thought_part);
                 } else if let Some(rc) = client_reasoning {
                     // 思考关闭时，将客户端传来的思考文本降级为普通文本 (对齐 Anthropic)
                     let text = if crate::proxy::thinking_store::is_placeholder_thought(rc) {
@@ -730,7 +813,9 @@ pub fn transform_openai_request_with_session(
                         continue;
                     }
 
-                    if !is_latest && args_str.len() > 1000 && !is_apply_patch_tool_name(&func_name)
+                    if truncate_historical
+                        && args_str.len() > 1000
+                        && !is_apply_patch_tool_name(&func_name)
                     {
                         args_str = "{\"_truncated\": \"Arguments truncated to save context window.\"}".to_string();
                     }
@@ -754,6 +839,7 @@ pub fn transform_openai_request_with_session(
 
                     // 1. 优先查本工具专属签名 (Responses API 优先校验客户端签名，其他协议或缺失时查工具缓存/会话缓存/哨兵)
                     let tool_specific_sig = crate::proxy::SignatureCache::global().get_tool_signature(&tc.id);
+                    let had_tool_sig = tool_specific_sig.is_some();
                     let mut effective_tc_sig = None;
                     if is_responses_api {
                         if let Some(ref sig) = tc.signature {
@@ -773,11 +859,41 @@ pub fn transform_openai_request_with_session(
                         }
                     }
 
+                    let trusted_client_used = effective_tc_sig.is_some();
                     if effective_tc_sig.is_none() {
                         effective_tc_sig = tool_specific_sig;
                     }
+                    let mut call_fallback_marked = false;
                     if effective_tc_sig.is_none() {
+                        // [V2A] Session-latest is a missing-signature fallback only;
+                        // mark it so authoritative per-turn restoration is not blocked.
                         effective_tc_sig = thought_sig.clone();
+                        if sig_ownership && effective_tc_sig.is_some() {
+                            used_sig_fallback = true;
+                            call_fallback_marked = true;
+                        }
+                    }
+
+                    {
+                        use crate::proxy::signature_source_diagnostics::SigSource;
+                        let sig_source = if effective_tc_sig.is_some() {
+                            if trusted_client_used {
+                                SigSource::TrustedClient
+                            } else if had_tool_sig {
+                                SigSource::ToolCache
+                            } else {
+                                SigSource::SessionFallback
+                            }
+                        } else if is_thinking_model || is_gemini_flash_thinking || actual_include_thinking {
+                            SigSource::Sentinel
+                        } else {
+                            SigSource::None
+                        };
+                        crate::proxy::signature_source_diagnostics::record_builder_function_call(
+                            &tc.id,
+                            sig_source,
+                            call_fallback_marked,
+                        );
                     }
 
                     if let Some(ref sig) = effective_tc_sig {
@@ -785,6 +901,12 @@ pub fn transform_openai_request_with_session(
                     } else if is_thinking_model || is_gemini_flash_thinking || actual_include_thinking {
                         tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
                         func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    }
+
+                    // [V2B] Mark only session-latest fallback functionCalls so the
+                    // finalize stage can stabilize historical unresolved ones.
+                    if v2b_stability && call_fallback_marked {
+                        func_call_part[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
                     }
 
                     parts.push(func_call_part);
@@ -802,7 +924,7 @@ pub fn transform_openai_request_with_session(
 
                 let content_val = match &msg.content {
                     Some(OpenAIContent::String(s)) => {
-                        if !is_latest
+                        if truncate_historical
                             && s.len() > 1000
                             && !should_preserve_tool_output(final_name, s)
                         {
@@ -902,7 +1024,13 @@ pub fn transform_openai_request_with_session(
                 parts.push(json!({ "text": " " }));
             }
 
-            json!({ "role": role, "parts": parts })
+            let mut message = json!({ "role": role, "parts": parts });
+            if sig_ownership && used_sig_fallback {
+                // [V2A] Mark the turn as fallback-signed only; consumed by the
+                // inbound thinking pipeline and stripped before serialization.
+                message[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
+            }
+            message
         })
         .filter(|msg| !msg["parts"].as_array().map(|a| a.is_empty()).unwrap_or(true))
         .collect();
@@ -912,6 +1040,15 @@ pub fn transform_openai_request_with_session(
     for msg in contents {
         if let Some(last) = merged_contents.last_mut() {
             if last["role"] == msg["role"] {
+                // [V2A] Propagate the fallback marker across same-role merges so a
+                // merged historical turn is still restorable.
+                if msg
+                    .get(crate::proxy::thinking_store::SIG_FALLBACK_MARKER)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    last[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] = json!(true);
+                }
                 // 合并 parts
                 if let (Some(last_parts), Some(msg_parts)) =
                     (last["parts"].as_array_mut(), msg["parts"].as_array())
@@ -1576,6 +1713,7 @@ pub fn transform_openai_request_with_session(
         crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
     }
 
+    crate::proxy::signature_source_diagnostics::finish_plan(&final_body);
     (final_body, session_id, message_count, prefix_hash)
 }
 
@@ -3063,5 +3201,1547 @@ mod tests {
                 id, args
             );
         }
+    }
+
+    // ==================================================================
+    // [V1] Append-only history regression suite
+    // ==================================================================
+
+    const V1_ARGS_TRUNCATION_TEXT: &str = "Arguments truncated to save context window.";
+    const V1_OUTPUT_TRUNCATION_PREFIX: &str =
+        "[Tool output truncated to save context. Original length: ";
+
+    fn big_task_args(seed: &str, prompt_len: usize) -> String {
+        let prompt = format!("{}-{}", seed, "p".repeat(prompt_len));
+        task_call_arguments(&format!("historical {seed}"), &prompt, "Explore")
+    }
+
+    /// Builds a conversation whose first tool call/response pair sits well
+    /// beyond `recent_message_window = 24` by appending `tail_messages`
+    /// alternating filler turns after it.
+    fn build_aged_history_request(
+        tail_messages: usize,
+        call_args: &str,
+        tool_result: &str,
+    ) -> OpenAIRequest {
+        let mut messages = vec![
+            OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIContent::String("start the task".to_string())),
+                ..Default::default()
+            },
+            OpenAIMessage {
+                role: "assistant".to_string(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_hist_1".to_string(),
+                    r#type: "function".to_string(),
+                    function: Some(ToolFunction {
+                        name: "task".to_string(),
+                        arguments: call_args.to_string(),
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            OpenAIMessage {
+                role: "tool".to_string(),
+                tool_call_id: Some("call_hist_1".to_string()),
+                name: Some("task".to_string()),
+                content: Some(OpenAIContent::String(tool_result.to_string())),
+                ..Default::default()
+            },
+        ];
+
+        for i in 0..tail_messages {
+            if i % 2 == 0 {
+                messages.push(OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String(format!("filler user {i}"))),
+                    ..Default::default()
+                });
+            } else {
+                messages.push(OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String(format!("filler model {i}"))),
+                    ..Default::default()
+                });
+            }
+        }
+
+        OpenAIRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages,
+            tools: Some(vec![task_tool_definition()]),
+            ..Default::default()
+        }
+    }
+
+    fn function_call_part_by_id(body: &Value, id: &str) -> Value {
+        model_function_call_parts(body)
+            .into_iter()
+            .find(|p| p["functionCall"]["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing functionCall id {id} in: {body}"))
+    }
+
+    fn function_response_parts(body: &Value) -> Vec<Value> {
+        body["request"]["contents"]
+            .as_array()
+            .expect("request.contents is array")
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .filter(|p| p.get("functionResponse").is_some())
+            .collect()
+    }
+
+    fn function_response_part_by_id(body: &Value, id: &str) -> Value {
+        function_response_parts(body)
+            .into_iter()
+            .find(|p| p["functionResponse"]["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing functionResponse id {id} in: {body}"))
+    }
+
+    fn transform_with_append_only(request: &OpenAIRequest, append_only: bool) -> Value {
+        set_append_only_history_override(Some(append_only));
+        let body = transform_openai_request(request, "test-proj", &request.model, None).0;
+        set_append_only_history_override(None);
+        body
+    }
+
+    fn assert_aged_history_pair_is_historical(req: &OpenAIRequest) {
+        // Guards the test fixture itself: with total > 26 the pair at indices
+        // 1 and 2 is outside the legacy window=24 recent tail.
+        assert!(req.messages.len() > 26);
+    }
+
+    #[test]
+    fn v1_append_only_flag_parsing_matches_documented_values() {
+        assert!(parse_append_only_history_flag(Some("1")));
+        assert!(parse_append_only_history_flag(Some("true")));
+        assert!(parse_append_only_history_flag(Some("TRUE")));
+        assert!(parse_append_only_history_flag(Some("True")));
+        assert!(!parse_append_only_history_flag(Some("0")));
+        assert!(!parse_append_only_history_flag(Some("false")));
+        assert!(!parse_append_only_history_flag(Some("FALSE")));
+        assert!(!parse_append_only_history_flag(Some("yes")));
+        assert!(!parse_append_only_history_flag(Some("")));
+        assert!(!parse_append_only_history_flag(None));
+    }
+
+    #[test]
+    fn v1_append_only_historical_function_call_args_stay_identical_beyond_window() {
+        let args = big_task_args("A", 1400);
+        assert!(
+            args.len() > 1000,
+            "fixture must exceed the truncation threshold"
+        );
+        let result = "R".repeat(1500);
+
+        let older = build_aged_history_request(30, &args, &result);
+        let newer = build_aged_history_request(31, &args, &result);
+        assert_aged_history_pair_is_historical(&older);
+        assert_aged_history_pair_is_historical(&newer);
+
+        let body_older = transform_with_append_only(&older, true);
+        let body_newer = transform_with_append_only(&newer, true);
+
+        let call_older = function_call_part_by_id(&body_older, "call_hist_1");
+        let call_newer = function_call_part_by_id(&body_newer, "call_hist_1");
+        let args_older = &call_older["functionCall"]["args"];
+        let args_newer = &call_newer["functionCall"]["args"];
+
+        assert_eq!(
+            args_older, args_newer,
+            "historical functionCall args changed as history grew"
+        );
+        assert_eq!(
+            serde_json::to_string(args_older).unwrap(),
+            serde_json::to_string(args_newer).unwrap(),
+            "historical functionCall args are no longer byte-identical"
+        );
+        assert!(
+            args_older["prompt"].as_str().unwrap().len() > 1000,
+            "historical args were truncated: {args_older}"
+        );
+        assert!(
+            args_older.get("_truncated").is_none(),
+            "append-only mode must not synthesize a truncation sentinel: {args_older}"
+        );
+    }
+
+    #[test]
+    fn v1_append_only_historical_function_response_result_stays_identical_beyond_window() {
+        let args = big_task_args("B", 1400);
+        let result = format!("BODY-{}-END", "R".repeat(1500));
+        assert!(result.len() > 1000);
+
+        let older = build_aged_history_request(30, &args, &result);
+        let newer = build_aged_history_request(31, &args, &result);
+
+        let body_older = transform_with_append_only(&older, true);
+        let body_newer = transform_with_append_only(&newer, true);
+
+        let resp_older = function_response_part_by_id(&body_older, "call_hist_1");
+        let resp_newer = function_response_part_by_id(&body_newer, "call_hist_1");
+        let result_older = resp_older["functionResponse"]["response"]["result"]
+            .as_str()
+            .expect("result must remain a string");
+        let result_newer = resp_newer["functionResponse"]["response"]["result"]
+            .as_str()
+            .expect("result must remain a string");
+
+        assert_eq!(
+            result_older, result,
+            "historical tool output was rewritten: {result_older}"
+        );
+        assert_eq!(
+            result_older, result_newer,
+            "historical tool output changed as history grew"
+        );
+        assert!(
+            !result_older.starts_with(V1_OUTPUT_TRUNCATION_PREFIX),
+            "append-only mode must not emit an output truncation sentinel"
+        );
+    }
+
+    #[test]
+    fn v1_append_only_sequential_turn_is_pure_content_append() {
+        let args = big_task_args("C", 1400);
+        let result = "R".repeat(1500);
+
+        let older = build_aged_history_request(30, &args, &result);
+        let newer = build_aged_history_request(31, &args, &result);
+
+        let body_older = transform_with_append_only(&older, true);
+        let body_newer = transform_with_append_only(&newer, true);
+
+        let contents_older = body_older["request"]["contents"].as_array().unwrap();
+        let contents_newer = body_newer["request"]["contents"].as_array().unwrap();
+        assert!(
+            contents_newer.len() > contents_older.len(),
+            "fixture must actually grow the conversation"
+        );
+        assert_eq!(
+            contents_older,
+            &contents_newer[..contents_older.len()],
+            "T+1 rewrote existing historical content instead of appending"
+        );
+
+        let (path, class) =
+            crate::proxy::cache_diagnostics::classify_diff(&body_older, &body_newer);
+        assert_eq!(
+            class, "CONTENT_APPEND_ONLY",
+            "expected pure append, got {class} at {path}"
+        );
+    }
+
+    #[test]
+    fn v1_append_only_parallel_calls_preserve_ids_args_and_pairing() {
+        let cases: Vec<(String, String)> = (0..5)
+            .map(|i| {
+                (
+                    format!("call_p{i}"),
+                    big_task_args(&format!("P{i}"), 1100 + i),
+                )
+            })
+            .collect();
+
+        let mut messages = vec![OpenAIMessage {
+            role: "user".to_string(),
+            content: Some(OpenAIContent::String("fan out five tasks".to_string())),
+            ..Default::default()
+        }];
+        messages.push(OpenAIMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(
+                cases
+                    .iter()
+                    .map(|(id, args)| ToolCall {
+                        id: id.clone(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "task".to_string(),
+                            arguments: args.clone(),
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        for (id, _) in &cases {
+            messages.push(OpenAIMessage {
+                role: "tool".to_string(),
+                tool_call_id: Some(id.clone()),
+                name: Some("task".to_string()),
+                content: Some(OpenAIContent::String(format!(
+                    "result-{id}-{}",
+                    "R".repeat(1200)
+                ))),
+                ..Default::default()
+            });
+        }
+        for i in 0..30 {
+            if i % 2 == 0 {
+                messages.push(OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String(format!("filler user {i}"))),
+                    ..Default::default()
+                });
+            } else {
+                messages.push(OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String(format!("filler model {i}"))),
+                    ..Default::default()
+                });
+            }
+        }
+        let req = OpenAIRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages,
+            tools: Some(vec![task_tool_definition()]),
+            ..Default::default()
+        };
+
+        let body = transform_with_append_only(&req, true);
+
+        let call_parts = model_function_call_parts(&body);
+        assert_eq!(call_parts.len(), 5, "expected five functionCall parts");
+        for (index, (id, args)) in cases.iter().enumerate() {
+            let call = &call_parts[index]["functionCall"];
+            assert_eq!(call["id"], id.as_str(), "call order changed at {index}");
+            assert_eq!(call["name"], "task");
+            assert_eq!(
+                call["args"],
+                serde_json::from_str::<Value>(args).unwrap(),
+                "args lost or reordered for {id}"
+            );
+        }
+
+        let response_parts = function_response_parts(&body);
+        assert_eq!(
+            response_parts.len(),
+            5,
+            "expected five functionResponse parts"
+        );
+        let response_ids: Vec<&str> = response_parts
+            .iter()
+            .map(|p| p["functionResponse"]["id"].as_str().unwrap())
+            .collect();
+        let expected_ids: Vec<&str> = cases.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            response_ids, expected_ids,
+            "response ordering/pairing changed"
+        );
+        for (id, _) in &cases {
+            let result = function_response_part_by_id(&body, id)["functionResponse"]["response"]
+                ["result"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(result.starts_with(&format!("result-{id}-")));
+            assert!(result.len() > 1000, "parallel output truncated for {id}");
+        }
+    }
+
+    #[test]
+    fn v1_kilo_task_payload_shape_is_preserved_when_historical() {
+        let args = big_task_args("E", 1200);
+        let result = "R".repeat(1500);
+        let req = build_aged_history_request(30, &args, &result);
+
+        let body = transform_with_append_only(&req, true);
+        let call = function_call_part_by_id(&body, "call_hist_1");
+        let args = &call["functionCall"]["args"];
+        let obj = args.as_object().expect("task args must be an object");
+
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["description", "prompt", "subagent_type"],
+            "kilo task payload shape changed: {args}"
+        );
+        assert_eq!(obj["description"].as_str().unwrap(), "historical E");
+        assert_eq!(obj["subagent_type"].as_str().unwrap(), "Explore");
+        assert!(obj["prompt"].as_str().unwrap().len() > 1000);
+    }
+
+    #[test]
+    fn v1_append_only_leaves_thought_signature_behavior_unchanged() {
+        let args = big_task_args("F", 1200);
+        let result = "R".repeat(1500);
+        let req = build_aged_history_request(30, &args, &result);
+
+        let legacy = transform_with_append_only(&req, false);
+        let append_only = transform_with_append_only(&req, true);
+
+        let sig_legacy = function_call_part_by_id(&legacy, "call_hist_1")["functionCall"]
+            .get("thoughtSignature")
+            .cloned();
+        let sig_append_only = function_call_part_by_id(&append_only, "call_hist_1")["functionCall"]
+            .get("thoughtSignature")
+            .cloned();
+
+        assert_eq!(
+            sig_legacy, sig_append_only,
+            "thoughtSignature behavior changed between legacy and append-only modes"
+        );
+
+        // The two modes must genuinely differ only in payload truncation.
+        assert_eq!(
+            function_call_part_by_id(&legacy, "call_hist_1")["functionCall"]["args"]["_truncated"],
+            V1_ARGS_TRUNCATION_TEXT
+        );
+        assert!(
+            function_call_part_by_id(&append_only, "call_hist_1")["functionCall"]["args"]
+                .get("_truncated")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn v1_legacy_mode_still_truncates_historical_tool_payloads() {
+        let args = big_task_args("G", 1200);
+        let result = "R".repeat(1500);
+        let req = build_aged_history_request(30, &args, &result);
+
+        let body = transform_with_append_only(&req, false);
+
+        let call = function_call_part_by_id(&body, "call_hist_1");
+        assert_eq!(
+            call["functionCall"]["args"]["_truncated"], V1_ARGS_TRUNCATION_TEXT,
+            "legacy rollback must keep historical args truncation"
+        );
+
+        let resp = function_response_part_by_id(&body, "call_hist_1");
+        assert_eq!(
+            resp["functionResponse"]["response"]["result"]
+                .as_str()
+                .unwrap(),
+            format!("{}{}]", V1_OUTPUT_TRUNCATION_PREFIX, result.len()),
+            "legacy rollback must keep historical output truncation"
+        );
+    }
+
+    // ==================================================================
+    // [V2A] Historical thoughtSignature ownership regression suite
+    // ==================================================================
+
+    const V2A_SIG_A: &str =
+        "V2A_REAL_A_012345678901234567890123456789012345678901234567890123456789012345";
+    const V2A_SIG_B: &str =
+        "V2A_REAL_B_987654321098765432109876543210987654321098765432109876543210987654";
+
+    fn with_signature_ownership<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        crate::proxy::thinking_store::set_signature_ownership_override(Some(enabled));
+        let out = f();
+        crate::proxy::thinking_store::set_signature_ownership_override(None);
+        out
+    }
+
+    fn v2a_unique_key(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    fn v2a_tool_request(session: &str, call_id: &str, reasoning: Option<&str>) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "gemini-3-pro".to_string(),
+            session_id: Some(session.to_string()),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String("run the task".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    reasoning_content: reasoning.map(str::to_string),
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "task".to_string(),
+                            arguments: "{}".to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    tool_call_id: Some(call_id.to_string()),
+                    name: Some("task".to_string()),
+                    content: Some(OpenAIContent::String("done".to_string())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn v2a_text_request(session: &str, visible: &str, reasoning: &str) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "gemini-3-pro".to_string(),
+            session_id: Some(session.to_string()),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String("ask".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String(visible.to_string())),
+                    reasoning_content: Some(reasoning.to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn v2a_seed_tool_record(session: &str, call_id: &str, sig: &str, thought: &str) {
+        use crate::proxy::thinking_store::{fingerprint, ThinkingRecord, ThinkingStore};
+        ThinkingStore::global().record(
+            session,
+            ThinkingRecord {
+                fingerprint: fingerprint("", &[call_id.to_string()], &["task".to_string()]),
+                thought: thought.to_string(),
+                signature: Some(sig.to_string()),
+                tool_ids: vec![call_id.to_string()],
+                tool_names: vec!["task".to_string()],
+                visible: String::new(),
+            },
+        );
+    }
+
+    fn v2a_seed_text_record(session: &str, sig: &str, thought: &str, visible: &str) {
+        use crate::proxy::thinking_store::{fingerprint, ThinkingRecord, ThinkingStore};
+        ThinkingStore::global().record(
+            session,
+            ThinkingRecord {
+                fingerprint: fingerprint(visible, &[], &[]),
+                thought: thought.to_string(),
+                signature: Some(sig.to_string()),
+                tool_ids: Vec::new(),
+                tool_names: Vec::new(),
+                visible: visible.to_string(),
+            },
+        );
+    }
+
+    fn v2a_cache_session_sig(session: &str, sig: &str) {
+        crate::proxy::SignatureCache::global().cache_session_signature(session, sig.to_string(), 7);
+    }
+
+    fn v2a_function_call_sig(body: &Value, call_id: &str) -> Option<String> {
+        model_function_call_parts(body)
+            .into_iter()
+            .find(|p| p["functionCall"]["id"].as_str() == Some(call_id))
+            .and_then(|p| p["thoughtSignature"].as_str().map(str::to_string))
+    }
+
+    fn v2a_thought_sig(body: &Value) -> Option<String> {
+        let contents = body["request"]["contents"].as_array()?;
+        contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .find(|p| p.get("thought").and_then(|t| t.as_bool()) == Some(true))
+            .and_then(|p| p["thoughtSignature"].as_str().map(str::to_string))
+    }
+
+    #[test]
+    fn v2a_1_historical_real_a_survives_session_latest_advance_to_b() {
+        let session = v2a_unique_key("v2a1");
+        let call_id = format!("call_v2a1_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "owned thought A");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2a_tool_request(
+            &session,
+            &call_id,
+            Some("a much longer client reasoning block that must not steal ownership"),
+        );
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "historical REAL A must remain byte-identical when session-latest is B"
+        );
+        assert_eq!(v2a_thought_sig(&body).as_deref(), Some(V2A_SIG_A));
+    }
+
+    #[test]
+    fn v2a_2_historical_function_call_real_a_is_not_replaced_by_session_latest_b() {
+        let session = v2a_unique_key("v2a2");
+        let call_id = format!("call_v2a2_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "short auth thought");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2a_tool_request(
+            &session,
+            &call_id,
+            Some("client reasoning that is clearly longer than the stored thought"),
+        );
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        let sig = v2a_function_call_sig(&body, &call_id);
+        assert_ne!(
+            sig.as_deref(),
+            Some(V2A_SIG_B),
+            "functionCall stole session-latest B"
+        );
+        assert_eq!(sig.as_deref(), Some(V2A_SIG_A));
+    }
+
+    #[test]
+    fn v2a_3_historical_thought_real_a_remains_a_in_responses_mode() {
+        let session = v2a_unique_key("v2a3");
+        let visible = "the historical answer";
+        v2a_seed_text_record(&session, V2A_SIG_A, "authored thought", visible);
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let reasoning = "client reasoning long enough to otherwise block replacement";
+        let req = v2a_text_request(&session, visible, reasoning);
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            transform_openai_request_with_session(
+                &req,
+                "proj",
+                "gemini-3-pro",
+                None,
+                &session,
+                Some(&session),
+                true,
+            )
+        });
+
+        assert_eq!(
+            v2a_thought_sig(&body).as_deref(),
+            Some(V2A_SIG_A),
+            "historical thought REAL A must remain A"
+        );
+    }
+
+    #[test]
+    fn v2a_4_historical_function_response_keeps_per_call_real_a() {
+        let session = v2a_unique_key("v2a4");
+        let call_id = format!("call_v2a4_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        let fr = function_response_part_by_id(&body, &call_id);
+        assert_eq!(
+            fr["thoughtSignature"].as_str(),
+            Some(V2A_SIG_A),
+            "functionResponse must keep its per-call REAL A"
+        );
+        assert_ne!(fr["thoughtSignature"].as_str(), Some(V2A_SIG_B));
+    }
+
+    #[test]
+    fn v2a_5_missing_historical_signature_still_receives_session_fallback() {
+        let session = v2a_unique_key("v2a5");
+        let call_id = format!("call_v2a5_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_B),
+            "missing signature must still get the session-latest REAL fallback"
+        );
+    }
+
+    #[test]
+    fn v2a_6_sentinel_missing_upgrades_to_authoritative_real() {
+        let session = v2a_unique_key("v2a6");
+        let call_id = format!("call_v2a6_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought");
+
+        // No session signature and no tool signature -> sentinel on the wire.
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "sentinel/missing must upgrade to the authoritative per-turn REAL"
+        );
+    }
+
+    #[test]
+    fn v2a_10_already_complete_does_not_block_restoration_after_session_fallback() {
+        let session = v2a_unique_key("v2a10");
+        let call_id = format!("call_v2a10_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "short auth");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let reasoning = "long client reasoning that would make the turn look already complete";
+        let req = v2a_tool_request(&session, &call_id, Some(reasoning));
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            transform_openai_request_with_session(
+                &req,
+                "proj",
+                "gemini-3-pro",
+                None,
+                &session,
+                Some(&session),
+                true,
+            )
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "session fallback REAL must not masquerade as authoritative ownership"
+        );
+        assert_eq!(v2a_thought_sig(&body).as_deref(), Some(V2A_SIG_A));
+    }
+
+    #[test]
+    fn v2a_10b_legacy_responses_already_complete_keeps_session_latest_b() {
+        let session = v2a_unique_key("v2a10b");
+        let call_id = format!("call_v2a10b_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "short auth");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let reasoning = "long client reasoning that would make the turn look already complete";
+        let req = v2a_tool_request(&session, &call_id, Some(reasoning));
+        let (body, _, _, _) = with_signature_ownership(false, || {
+            transform_openai_request_with_session(
+                &req,
+                "proj",
+                "gemini-3-pro",
+                None,
+                &session,
+                Some(&session),
+                true,
+            )
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_B),
+            "legacy Responses path: already_complete must still let session-latest B survive"
+        );
+    }
+
+    #[test]
+    fn v2a_11_flag_off_preserves_legacy_session_latest_behavior() {
+        let session = v2a_unique_key("v2a11");
+        let call_id = format!("call_v2a11_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "short auth");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let reasoning = "long client reasoning that would make the turn look already complete";
+        let req = v2a_tool_request(&session, &call_id, Some(reasoning));
+        let body = with_signature_ownership(false, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_B),
+            "legacy mode must keep stamping session-latest B onto the historical functionCall"
+        );
+    }
+
+    #[test]
+    fn v2a_flag_parsing_matches_documented_values() {
+        use crate::proxy::thinking_store::parse_signature_ownership_flag;
+        assert!(parse_signature_ownership_flag(Some("1")));
+        assert!(parse_signature_ownership_flag(Some("true")));
+        assert!(parse_signature_ownership_flag(Some("TRUE")));
+        assert!(parse_signature_ownership_flag(Some("True")));
+        assert!(!parse_signature_ownership_flag(Some("0")));
+        assert!(!parse_signature_ownership_flag(Some("false")));
+        assert!(!parse_signature_ownership_flag(Some("yes")));
+        assert!(!parse_signature_ownership_flag(Some("")));
+        assert!(!parse_signature_ownership_flag(None));
+    }
+
+    // ==================================================================
+    // [D3] [CACHE-SIG-SOURCE] observability attribution suite
+    // ==================================================================
+
+    use crate::proxy::cache_diagnostics::short_hash as d3_short_hash;
+    use crate::proxy::signature_source_diagnostics::{
+        self as d3, observations_for_body, RestorePhase, SigSource,
+    };
+
+    fn d3_enable() {
+        d3::reset_for_tests();
+        d3::set_enabled_for_tests(true);
+    }
+
+    fn d3_cleanup() {
+        d3::clear_enabled_for_tests();
+        d3::reset_for_tests();
+    }
+
+    fn d3_tool_hash(call_id: &str) -> String {
+        d3_short_hash(&format!("toolid|{call_id}"))
+    }
+
+    fn d3_obs(
+        body: &Value,
+        call_id: &str,
+    ) -> Option<crate::proxy::signature_source_diagnostics::SigSourceObservation> {
+        let want = d3_tool_hash(call_id);
+        observations_for_body(body)
+            .into_iter()
+            .find(|o| o.tool_id_hash == want)
+    }
+
+    fn d3_lines(body: &Value) -> Vec<String> {
+        observations_for_body(body)
+            .iter()
+            .map(|o| d3::format_line(o, "d3_traj", 42))
+            .collect()
+    }
+
+    fn d3_deterministic_request(session: &str, call_id: &str) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "gemini-2.0-flash".to_string(),
+            session_id: Some(session.to_string()),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String("hi".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "task".to_string(),
+                            arguments: "{}".to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn d3_1_tool_cache_assignment_attributed() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_1");
+        let call_id = format!("call_d3_1_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::ToolCache);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::None);
+        assert!(obs.entry.store_record_hash.is_none());
+        assert!(!obs.entry.fallback_marked);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_2_session_fallback_survives() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_2");
+        let call_id = format!("call_d3_2_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::SessionFallback);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::None);
+        assert!(obs.entry.fallback_marked);
+        assert_eq!(obs.entry.session_lookup, "LATEST");
+        assert!(obs.entry.store_record_hash.is_none());
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_3_session_fallback_then_p1_restore() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_3");
+        let call_id = format!("call_d3_3_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought d3_3");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A)
+        );
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::PerTurnStore);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::P1ToolId);
+        assert!(obs.entry.fallback_marked);
+        let expected = d3::store_record_hash(&crate::proxy::thinking_store::fingerprint(
+            "",
+            &[call_id.clone()],
+            &["task".to_string()],
+        ));
+        assert_eq!(obs.entry.store_record_hash.as_deref(), Some(expected.as_str()));
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_4_tool_cache_then_p1_restore() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_4");
+        let call_id = format!("call_d3_4_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_B.to_string());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought d3_4");
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A)
+        );
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::PerTurnStore);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::P1ToolId);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_5_trusted_responses_real() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_5");
+        let call_id = format!("call_d3_5_{}", uuid::Uuid::new_v4());
+        let mut req = v2a_tool_request(&session, &call_id, None);
+        if let Some(tcs) = req.messages[1].tool_calls.as_mut() {
+            tcs[0].signature = Some(V2A_SIG_A.to_string());
+        }
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            transform_openai_request_with_session(
+                &req,
+                "proj",
+                "gemini-3-pro",
+                None,
+                &session,
+                Some(&session),
+                true,
+            )
+        });
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A)
+        );
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::TrustedClient);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::None);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_6_sentinel() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_6");
+        let call_id = format!("call_d3_6_{}", uuid::Uuid::new_v4());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::Sentinel);
+        assert_eq!(obs.entry.restore_phase, RestorePhase::None);
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_7_final_indices_match_serialized_body() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_7");
+        let call_id = format!("call_d3_7_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let obs_list = observations_for_body(&body);
+        let obs = obs_list
+            .iter()
+            .find(|o| o.tool_id_hash == d3_tool_hash(&call_id))
+            .expect("observation present");
+        assert!(
+            obs.content_index != 0 || obs.part_index != 0,
+            "fixture must not put the functionCall at contents[0].parts[0]"
+        );
+        let id_at = body["request"]["contents"][obs.content_index]["parts"][obs.part_index]
+            ["functionCall"]["id"]
+            .as_str()
+            .expect("final body has functionCall id at reported index");
+        assert_eq!(id_at, call_id);
+        assert_eq!(d3_tool_hash(id_at), obs.tool_id_hash);
+        assert!(
+            body["request"]["contents"][0]["parts"][0]
+                .get("functionCall")
+                .is_none()
+        );
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_8_two_records_different_store_hash() {
+        let _d3_lock = d3::test_lock();
+        let a = d3::store_record_hash("fp-a");
+        let b = d3::store_record_hash("fp-b");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 16);
+        assert_eq!(b.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(b.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, d3::store_record_hash("fp-a"));
+    }
+
+    #[test]
+    fn d3_9_raw_tool_id_absent() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_9");
+        let call_id = format!("call_d3_9_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let lines = d3_lines(&body);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(!line.contains(&call_id), "raw tool id leaked: {line}");
+            assert!(line.contains(&d3_tool_hash(&call_id)));
+        }
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_10_raw_fingerprint_absent() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_10");
+        let call_id = format!("call_d3_10_{}", uuid::Uuid::new_v4());
+        let raw_fp = format!("D3_RAW_FP_SECRET_{}", uuid::Uuid::new_v4());
+        use crate::proxy::thinking_store::{ThinkingRecord, ThinkingStore};
+        ThinkingStore::global().record(
+            &session,
+            ThinkingRecord {
+                fingerprint: raw_fp.clone(),
+                thought: "d3_10 thought".to_string(),
+                signature: Some(V2A_SIG_A.to_string()),
+                tool_ids: vec![call_id.clone()],
+                tool_names: vec!["task".to_string()],
+                visible: String::new(),
+            },
+        );
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(
+            obs.entry.store_record_hash.as_deref(),
+            Some(d3::store_record_hash(&raw_fp).as_str())
+        );
+        for line in d3_lines(&body) {
+            assert!(!line.contains(&raw_fp), "raw fingerprint leaked: {line}");
+        }
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_11_raw_signature_and_derived_hash_absent() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("d3_11");
+        let call_id = format!("call_d3_11_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "d3_11 thought");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        let lines = d3_lines(&body);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(!line.contains(V2A_SIG_A), "raw signature A leaked");
+            assert!(!line.contains(V2A_SIG_B), "raw signature B leaked");
+            assert!(
+                !line.contains(&d3_short_hash(V2A_SIG_A)),
+                "derived sig hash A leaked"
+            );
+            assert!(
+                !line.contains(&d3_short_hash(V2A_SIG_B)),
+                "derived sig hash B leaked"
+            );
+        }
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_12_on_off_bytes_identical() {
+        let _d3_lock = d3::test_lock();
+        let session = v2a_unique_key("d3_12");
+        let call_id = format!("call_d3_12_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = d3_deterministic_request(&session, &call_id);
+
+        d3::reset_for_tests();
+        d3::set_enabled_for_tests(false);
+        let body_off = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-2.0-flash", None).0
+        });
+        assert!(!d3::has_plan_for_body(&body_off));
+        assert!(observations_for_body(&body_off).is_empty());
+
+        d3::set_enabled_for_tests(true);
+        let body_on = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-2.0-flash", None).0
+        });
+        assert!(d3::has_plan_for_body(&body_on));
+        assert!(!observations_for_body(&body_on).is_empty());
+
+        let mut a = body_off.clone();
+        let mut b = body_on.clone();
+        a["requestId"] = json!("d3-fixed-request-id");
+        b["requestId"] = json!("d3-fixed-request-id");
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "serialized request body must be byte-identical with diagnostics off vs on"
+        );
+
+        d3_cleanup();
+    }
+
+    #[test]
+    fn d3_15_disabled_no_line_no_state() {
+        let _d3_lock = d3::test_lock();
+        d3_cleanup();
+        d3::set_enabled_for_tests(false);
+        let before = d3::registry_len_for_tests();
+        let session = v2a_unique_key("d3_15");
+        let call_id = format!("call_d3_15_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = with_signature_ownership(true, || {
+            transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+        });
+        assert!(!d3::active_plan_present());
+        assert!(!d3::has_plan_for_body(&body));
+        assert!(observations_for_body(&body).is_empty());
+        assert_eq!(d3::registry_len_for_tests(), before);
+        d3_cleanup();
+    }
+
+    // ==================================================================
+    // [V2B] Historical session-fallback stability regression suite
+    // ==================================================================
+
+    fn with_v2b_stability<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        crate::proxy::thinking_store::set_historical_session_fallback_stability_override(Some(
+            enabled,
+        ));
+        let out = f();
+        crate::proxy::thinking_store::set_historical_session_fallback_stability_override(None);
+        out
+    }
+
+    fn v2b_historical_request(session: &str, call_id: &str) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "gemini-3-pro".to_string(),
+            session_id: Some(session.to_string()),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String("run the task".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: call_id.to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "task".to_string(),
+                            arguments: "{}".to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    tool_call_id: Some(call_id.to_string()),
+                    name: Some("task".to_string()),
+                    content: Some(OpenAIContent::String("done".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String("all done".to_string())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn v2b_historical_parallel_request(
+        session: &str,
+        call_a: &str,
+        call_b: &str,
+    ) -> OpenAIRequest {
+        OpenAIRequest {
+            model: "gemini-3-pro".to_string(),
+            session_id: Some(session.to_string()),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    content: Some(OpenAIContent::String("run the task".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: call_a.to_string(),
+                            r#type: "function".to_string(),
+                            function: Some(ToolFunction {
+                                name: "task".to_string(),
+                                arguments: "{}".to_string(),
+                            }),
+                            ..Default::default()
+                        },
+                        ToolCall {
+                            id: call_b.to_string(),
+                            r#type: "function".to_string(),
+                            function: Some(ToolFunction {
+                                name: "task".to_string(),
+                                arguments: "{}".to_string(),
+                            }),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    tool_call_id: Some(call_a.to_string()),
+                    name: Some("task".to_string()),
+                    content: Some(OpenAIContent::String("done a".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    tool_call_id: Some(call_b.to_string()),
+                    name: Some("task".to_string()),
+                    content: Some(OpenAIContent::String("done b".to_string())),
+                    ..Default::default()
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String("all done".to_string())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn v2b_transform_historical(req: &OpenAIRequest) -> Value {
+        with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request(req, "proj", "gemini-3-pro", None).0
+            })
+        })
+    }
+
+    #[test]
+    fn v2b_1_historical_session_fallback_stabilized_to_sentinel() {
+        let session = v2a_unique_key("v2b1");
+        let call_id = format!("call_v2b1_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        let sig = v2a_function_call_sig(&body, &call_id);
+        assert_eq!(
+            sig.as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "unresolved historical session fallback must be stabilized to the sentinel"
+        );
+        assert_ne!(sig.as_deref(), Some(V2A_SIG_A));
+        let part = function_call_part_by_id(&body, &call_id);
+        assert!(
+            part.get(crate::proxy::thinking_store::SIG_FALLBACK_MARKER)
+                .is_none(),
+            "internal marker must be stripped before serialization"
+        );
+    }
+
+    #[test]
+    fn v2b_2_historical_function_call_byte_stable_when_session_latest_changes() {
+        let call_id = format!("call_v2b2_{}", uuid::Uuid::new_v4());
+        // A fresh unique session per cache state keeps the cached session-latest
+        // from bleeding between the A and B sub-cases.
+        let session_a = v2a_unique_key("v2b2-a");
+        let session_b = v2a_unique_key("v2b2-b");
+        v2a_cache_session_sig(&session_a, V2A_SIG_A);
+        v2a_cache_session_sig(&session_b, V2A_SIG_B);
+        let req_a = v2b_historical_request(&session_a, &call_id);
+        let req_b = v2b_historical_request(&session_b, &call_id);
+
+        // Baseline: V2A ON with V2B OFF. The historical functionCall still rides
+        // the session-latest fallback, so it tracks the changing A/B value. This
+        // proves the fallback path is live and genuinely unstable without V2B.
+        let off_a = with_signature_ownership(true, || {
+            transform_openai_request(&req_a, "proj", "gemini-3-pro", None).0
+        });
+        let off_b = with_signature_ownership(true, || {
+            transform_openai_request(&req_b, "proj", "gemini-3-pro", None).0
+        });
+        assert_eq!(
+            v2a_function_call_sig(&off_a, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "without V2B the historical functionCall must fall back to session-latest A"
+        );
+        assert_eq!(
+            v2a_function_call_sig(&off_b, &call_id).as_deref(),
+            Some(V2A_SIG_B),
+            "without V2B the historical functionCall must fall back to session-latest B"
+        );
+
+        // With V2B ON the unresolved session fallback is stabilized, so the
+        // historical functionCall bytes are identical regardless of A or B.
+        let body_a = v2b_transform_historical(&req_a);
+        let body_b = v2b_transform_historical(&req_b);
+
+        let part_a = function_call_part_by_id(&body_a, &call_id);
+        let part_b = function_call_part_by_id(&body_b, &call_id);
+        assert_eq!(
+            serde_json::to_string(&part_a).unwrap(),
+            serde_json::to_string(&part_b).unwrap(),
+            "historical functionCall bytes must not change when session-latest advances"
+        );
+        assert_eq!(
+            part_a["thoughtSignature"].as_str(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE)
+        );
+        assert_eq!(
+            part_b["thoughtSignature"].as_str(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE)
+        );
+    }
+
+    #[test]
+    fn v2b_3_historical_fallback_then_p1_restore_uses_authoritative_real() {
+        let session = v2a_unique_key("v2b3");
+        let call_id = format!("call_v2b3_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought v2b3");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "authoritative per-turn restore must win over stabilization"
+        );
+    }
+
+    #[test]
+    fn v2b_4_historical_tool_cache_real_unchanged() {
+        let session = v2a_unique_key("v2b4");
+        let call_id = format!("call_v2b4_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_id, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "tool-cache REAL is authoritative and must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn v2b_5_historical_trusted_responses_real_unchanged() {
+        let session = v2a_unique_key("v2b5");
+        let call_id = format!("call_v2b5_{}", uuid::Uuid::new_v4());
+        let mut req = v2b_historical_request(&session, &call_id);
+        if let Some(tcs) = req.messages[1].tool_calls.as_mut() {
+            tcs[0].signature = Some(V2A_SIG_A.to_string());
+        }
+
+        let (body, _, _, _) = with_signature_ownership(true, || {
+            with_v2b_stability(true, || {
+                transform_openai_request_with_session(
+                    &req,
+                    "proj",
+                    "gemini-3-pro",
+                    None,
+                    &session,
+                    Some(&session),
+                    true,
+                )
+            })
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "trusted Responses client REAL must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn v2b_6_historical_authoritative_per_turn_real_unchanged() {
+        let session = v2a_unique_key("v2b6");
+        let call_id = format!("call_v2b6_{}", uuid::Uuid::new_v4());
+        v2a_seed_tool_record(&session, &call_id, V2A_SIG_A, "authoritative thought v2b6");
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "per-turn authoritative REAL must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn v2b_7_live_session_fallback_unchanged() {
+        let session = v2a_unique_key("v2b7");
+        let call_id = format!("call_v2b7_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2a_tool_request(&session, &call_id, None);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "live/last model turn fallback must NOT be stabilized"
+        );
+    }
+
+    #[test]
+    fn v2b_8_parallel_calls_only_unresolved_fallback_downgraded() {
+        let session = v2a_unique_key("v2b8");
+        let call_a = format!("call_v2b8a_{}", uuid::Uuid::new_v4());
+        let call_b = format!("call_v2b8b_{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global()
+            .cache_tool_signature(&call_a, V2A_SIG_A.to_string());
+        v2a_cache_session_sig(&session, V2A_SIG_B);
+
+        let req = v2b_historical_parallel_request(&session, &call_a, &call_b);
+        let body = v2b_transform_historical(&req);
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_a).as_deref(),
+            Some(V2A_SIG_A),
+            "resolved parallel call A must keep its tool-cache REAL"
+        );
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_b).as_deref(),
+            Some(crate::proxy::thinking_store::SENTINEL_SIGNATURE),
+            "unresolved parallel call B fallback must be stabilized"
+        );
+    }
+
+    #[test]
+    fn v2b_10_feature_flag_off_legacy_behavior() {
+        let session = v2a_unique_key("v2b10");
+        let call_id = format!("call_v2b10_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = with_signature_ownership(true, || {
+            with_v2b_stability(false, || {
+                transform_openai_request(&req, "proj", "gemini-3-pro", None).0
+            })
+        });
+
+        assert_eq!(
+            v2a_function_call_sig(&body, &call_id).as_deref(),
+            Some(V2A_SIG_A),
+            "V2B off must preserve the legacy session-fallback REAL"
+        );
+    }
+
+    #[test]
+    fn v2b_diag_action_reported() {
+        let _d3_lock = d3::test_lock();
+        d3_enable();
+        let session = v2a_unique_key("v2bdiag");
+        let call_id = format!("call_v2bdiag_{}", uuid::Uuid::new_v4());
+        v2a_cache_session_sig(&session, V2A_SIG_A);
+
+        let req = v2b_historical_request(&session, &call_id);
+        let body = v2b_transform_historical(&req);
+
+        let obs = d3_obs(&body, &call_id).expect("observation present");
+        assert_eq!(obs.entry.source, SigSource::SessionFallback);
+        assert!(obs.entry.fallback_marked);
+        assert_eq!(
+            obs.entry.v2b_action,
+            crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel
+        );
+
+        let line = d3::format_line(&obs, "d3_traj", 42);
+        assert!(
+            line.contains("v2b_action=STABILIZED_TO_SENTINEL"),
+            "diag line must report the V2B action: {line}"
+        );
+        assert!(!line.contains(V2A_SIG_A), "raw signature leaked: {line}");
+        d3_cleanup();
     }
 }

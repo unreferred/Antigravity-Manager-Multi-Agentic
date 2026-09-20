@@ -446,6 +446,10 @@ impl UpstreamClient {
 
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
+                // [CACHE-DIAG] OBSERVABILITY ONLY — read-only inspection of the exact
+                // serialized bytes. Must not mutate body_bytes or body.
+                crate::proxy::cache_diagnostics::observe(&body_bytes, &body, method, account_id);
+
                 let mut req_builder = client.post(&url).headers(headers.clone());
 
                 // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真

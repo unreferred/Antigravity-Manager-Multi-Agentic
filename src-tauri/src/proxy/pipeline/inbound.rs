@@ -96,6 +96,16 @@ impl InboundThinkingPipeline {
                             if let Some(sig) = effective_sig {
                                 thought_obj["thoughtSignature"] = json!(sig);
                             }
+                            // [V2B] Preserve the internal fallback provenance marker
+                            // (stripped later by finalize) so historical unresolved
+                            // fallback thought signatures can be stabilized.
+                            if part
+                                .get(crate::proxy::thinking_store::SIG_FALLBACK_MARKER)
+                                .is_some()
+                            {
+                                thought_obj[crate::proxy::thinking_store::SIG_FALLBACK_MARKER] =
+                                    json!(true);
+                            }
                             new_parts.push(thought_obj);
                         } else {
                             saw_non_thinking = true;

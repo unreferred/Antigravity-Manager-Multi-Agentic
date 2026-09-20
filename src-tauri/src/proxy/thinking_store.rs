@@ -21,6 +21,106 @@ use std::time::{Duration, Instant};
 
 const MIN_SIGNATURE_LENGTH: usize = 50;
 pub const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// Environment switch for V2A "historical signature ownership".
+///
+/// Enabled (`ABV_SIGNATURE_OWNERSHIP=1` or `true`) makes a REAL provider
+/// `thoughtSignature` belong to the exact historical model turn that produced
+/// it: once a historical turn owns authoritative REAL `S(T)`, a newer
+/// session-level REAL belonging to another turn can no longer replace it.
+///
+/// Disabled / unset keeps the exact legacy behavior.
+pub const SIGNATURE_OWNERSHIP_ENV: &str = "ABV_SIGNATURE_OWNERSHIP";
+
+/// Internal, request-scoped marker for signatures that were stamped from a
+/// session-latest fallback rather than from the historical turn's own
+/// authoritative REAL. It is consumed by the inbound thinking pipeline
+/// (ingest/restore) and stripped by `finalize_gemini_contents_thinking`, so it
+/// never reaches the upstream wire payload.
+pub(crate) const SIG_FALLBACK_MARKER: &str = "_abv_sig_fallback";
+
+#[cfg(test)]
+thread_local! {
+    static SIGNATURE_OWNERSHIP_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_signature_ownership_override(value: Option<bool>) {
+    SIGNATURE_OWNERSHIP_TEST_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// Parses the documented flag values: `1` / `true` enable ownership; `0` /
+/// `false` / unset (and any other value) keep the legacy behavior.
+pub fn parse_signature_ownership_flag(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
+}
+
+/// Returns the effective V2A historical-signature-ownership mode.
+pub fn signature_ownership_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = SIGNATURE_OWNERSHIP_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+
+    parse_signature_ownership_flag(std::env::var(SIGNATURE_OWNERSHIP_ENV).ok().as_deref())
+}
+
+/// Environment switch for V2B "historical session-fallback stability".
+///
+/// Enabled (`ABV_HISTORICAL_SESSION_FALLBACK_STABILITY=1` or `true`). When ON,
+/// a HISTORICAL model turn whose functionCall signature still came only from the
+/// session-latest fallback (V2A `SIG_FALLBACK_MARKER`, not replaced by an
+/// authoritative ThinkingStore/tool-cache/trusted restore) is stabilized to the
+/// established compatibility sentinel instead of serializing a changing REAL.
+/// The live/last model turn and all authoritative sources are untouched.
+///
+/// Disabled / unset keeps the exact current behavior.
+///
+/// NOTE: This is a layer on top of V2A provenance and is inert unless
+/// `ABV_SIGNATURE_OWNERSHIP` is also enabled (the per-part fallback marker is
+/// only produced by the V2A path).
+pub const HISTORICAL_SESSION_FALLBACK_STABILITY_ENV: &str =
+    "ABV_HISTORICAL_SESSION_FALLBACK_STABILITY";
+
+#[cfg(test)]
+thread_local! {
+    static HISTORICAL_SESSION_FALLBACK_STABILITY_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_historical_session_fallback_stability_override(value: Option<bool>) {
+    HISTORICAL_SESSION_FALLBACK_STABILITY_TEST_OVERRIDE.with(|cell| cell.set(value));
+}
+
+/// Parses the documented flag values: `1` / `true` enable; anything else keeps
+/// the legacy behavior.
+pub fn parse_historical_session_fallback_stability_flag(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
+}
+
+/// Returns the effective V2B historical session-fallback stability mode.
+pub fn historical_session_fallback_stability_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = HISTORICAL_SESSION_FALLBACK_STABILITY_TEST_OVERRIDE.with(|cell| cell.get())
+    {
+        return forced;
+    }
+
+    parse_historical_session_fallback_stability_flag(
+        std::env::var(HISTORICAL_SESSION_FALLBACK_STABILITY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 const MAX_SESSIONS: usize = 2000;
 const MAX_TURNS_PER_SESSION: usize = 200;
 const MAX_BYTES_PER_SESSION: usize = 32 * 1024 * 1024;
@@ -189,22 +289,34 @@ impl ThinkingStore {
                 .is_some_and(|last| last.fingerprint == rec.fingerprint);
 
             if merge_last {
+                let ownership = signature_ownership_enabled();
                 let (stronger, old_text_bytes) = {
                     let last = entry.turns.last().expect("merge_last");
-                    (
+                    let stronger = if ownership {
+                        is_stronger_record(&rec, last)
+                    } else {
                         rec.thought.len() >= last.thought.len()
                             || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                                > last.signature.as_ref().map(|s| s.len()).unwrap_or(0),
-                        last.thought.len() + last.visible.len(),
-                    )
+                                > last.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                    };
+                    (stronger, last.thought.len() + last.visible.len())
                 };
                 if stronger {
+                    // V2A: metadata may grow, but a REAL signature already owned
+                    // by this historical turn is never replaced by a different one.
+                    let merged = if ownership {
+                        let last = entry.turns.last().expect("merge_last");
+                        merge_record_ownership(rec, last)
+                    } else {
+                        rec
+                    };
+                    let merged_bytes = record_bytes(&merged);
                     entry.bytes = entry.bytes.saturating_sub(old_text_bytes);
                     {
                         let last_arc = entry.turns.last_mut().expect("merge_last");
-                        *Arc::make_mut(last_arc) = rec;
+                        *Arc::make_mut(last_arc) = merged;
                     }
-                    entry.bytes = entry.bytes.saturating_add(rec_bytes);
+                    entry.bytes = entry.bytes.saturating_add(merged_bytes);
                     entry.turns.last().cloned()
                 } else {
                     None
@@ -333,6 +445,18 @@ impl ThinkingStore {
             for part in parts {
                 acc.ingest_part(part);
             }
+            // V2A: a session-latest fallback signature stamped at request-build
+            // time is not proof that this historical turn owns it. Keep any
+            // capturable thought text as metadata, but never adopt the fallback
+            // signature as this turn's authoritative REAL.
+            if signature_ownership_enabled()
+                && content
+                    .get(SIG_FALLBACK_MARKER)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                acc.signature = None;
+            }
             if !acc.should_capture() {
                 continue;
             }
@@ -351,7 +475,9 @@ impl ThinkingStore {
             if let Some(idx) = match_existing_record(&rec, &existing, &used) {
                 used[idx] = true;
                 if is_stronger_record(&rec, &existing[idx]) {
-                    to_upgrade.push((idx, rec));
+                    // V2A: metadata enrichment may replace the record, but an
+                    // already-authoritative historical REAL stays owned by it.
+                    to_upgrade.push((idx, merge_record_ownership(rec, &existing[idx])));
                 }
             } else {
                 to_append.push(rec);
@@ -417,7 +543,13 @@ impl ThinkingStore {
             existing_thought: String,
             fp: String,
             matched_record_idx: Option<usize>,
+            /// OBSERVABILITY ONLY: which restore phase matched the record.
+            matched_phase: Option<&'static str>,
             already_complete: bool,
+            /// V2A: signatures on this turn came only from session-latest
+            /// fallback, so `already_complete` must not block restoration of the
+            /// turn's authoritative per-turn REAL.
+            sig_fallback_stamped: bool,
         }
 
         let mut model_turns: Vec<ModelTurnMeta> = Vec::new();
@@ -430,7 +562,13 @@ impl ThinkingStore {
                 continue;
             };
             let (visible, tool_ids, tool_names, existing_thought) = inspect_parts(parts);
-            let already_complete = !turn_needs_restore(parts, &existing_thought);
+            let sig_fallback_stamped = signature_ownership_enabled()
+                && content
+                    .get(SIG_FALLBACK_MARKER)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let already_complete =
+                !sig_fallback_stamped && !turn_needs_restore(parts, &existing_thought);
             // Agent tool turns match by tool_id (Phase 1). Skip fingerprint /
             // whitespace-normalize until a later phase actually needs them.
             model_turns.push(ModelTurnMeta {
@@ -442,7 +580,9 @@ impl ThinkingStore {
                 existing_thought,
                 fp: String::new(),
                 matched_record_idx: None,
+                matched_phase: None,
                 already_complete,
+                sig_fallback_stamped,
             });
         }
 
@@ -477,6 +617,7 @@ impl ThinkingStore {
                 };
                 if let Some(&rec_idx) = idxs.iter().rev().find(|&&i| !used[i]) {
                     turn.matched_record_idx = Some(rec_idx);
+                    turn.matched_phase = Some("P1_TOOL_ID");
                     used[rec_idx] = true;
                     break;
                 }
@@ -504,6 +645,7 @@ impl ThinkingStore {
                 rec_has_tools == turn_has_tools
             }) {
                 turn.matched_record_idx = Some(rec_idx);
+                turn.matched_phase = Some("P2_FINGERPRINT");
                 used[rec_idx] = true;
             }
         }
@@ -551,6 +693,7 @@ impl ThinkingStore {
                         || (norm_rec.len() >= 20 && norm_vis.ends_with(norm_rec))
                     {
                         turn.matched_record_idx = Some(rec_idx);
+                        turn.matched_phase = Some("P3_TEXT");
                         used[rec_idx] = true;
                         break;
                     }
@@ -574,6 +717,7 @@ impl ThinkingStore {
                     })
                 {
                     last_turn.matched_record_idx = Some(last_unused_rec_idx);
+                    last_turn.matched_phase = Some("P4_TAIL");
                     used[last_unused_rec_idx] = true;
                 }
             }
@@ -603,7 +747,8 @@ impl ThinkingStore {
                 .iter()
                 .any(|p| p.get("functionCall").is_some() && !part_has_signature(p));
 
-            let should_replace = is_placeholder_thought(&turn.existing_thought)
+            let should_replace = turn.sig_fallback_stamped
+                || is_placeholder_thought(&turn.existing_thought)
                 || turn.existing_thought.len() < rec.thought.len()
                 || (rec.signature.is_some() && !parts.iter().any(|p| part_has_signature(p)))
                 || has_unvalidated_function_call;
@@ -625,11 +770,18 @@ impl ThinkingStore {
                 "text": thought_text,
                 "thought": true,
             });
+            let mut real_sig_used = false;
             if let Some(sig) = rec.signature.as_ref().filter(|s| is_real_signature(s)) {
+                real_sig_used = true;
                 thought_part["thoughtSignature"] = json!(sig);
                 for part in parts.iter_mut() {
                     if part.get("functionCall").is_some() {
                         part["thoughtSignature"] = json!(sig);
+                        // [V2B] An authoritative per-turn REAL replaced any
+                        // session-latest fallback on this functionCall.
+                        if let Some(obj) = part.as_object_mut() {
+                            obj.remove(SIG_FALLBACK_MARKER);
+                        }
                     }
                 }
             } else {
@@ -641,6 +793,31 @@ impl ThinkingStore {
                 }
             }
             parts.insert(0, thought_part);
+            // [CACHE-SIG-SOURCE] OBSERVABILITY ONLY: attribute the FINAL effective
+            // source for each functionCall when a real per-turn signature was
+            // stamped. No-op (and no hashing) when diagnostics are disabled.
+            if real_sig_used && crate::proxy::signature_source_diagnostics::is_enabled() {
+                let rec_hash =
+                    crate::proxy::signature_source_diagnostics::store_record_hash(&rec.fingerprint);
+                let phase_tag = turn.matched_phase.unwrap_or("NONE");
+                for part in parts.iter() {
+                    let Some(id) = part
+                        .get("functionCall")
+                        .and_then(|f| f.get("id"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    if !id.is_empty() {
+                        crate::proxy::signature_source_diagnostics::record_restore_function_call(
+                            id,
+                            phase_tag,
+                            &rec_hash,
+                            turn.sig_fallback_stamped,
+                        );
+                    }
+                }
+            }
             restored += 1;
         }
 
@@ -1014,13 +1191,83 @@ pub fn capture_gemini_response(store_key: &str, response: &Value) {
     }
 }
 
+/// [V2B] Replaces an unresolved historical model turn's session-latest fallback
+/// REAL signatures with the protocol-compatible sentinel.
+///
+/// Only parts that still carry the internal `SIG_FALLBACK_MARKER` are touched:
+/// the builder only sets it for session-latest fallback parts, and
+/// `restore_gemini_contents` clears it as soon as an authoritative per-turn REAL
+/// is stamped. Authoritative tool-cache / trusted-client / restored signatures
+/// therefore never carry the marker and are left untouched.
+fn stabilize_historical_session_fallback_parts(content: &mut Value) -> usize {
+    let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) else {
+        return 0;
+    };
+    let mut stabilized = 0usize;
+    for part in parts.iter_mut() {
+        let marked = part
+            .get(SIG_FALLBACK_MARKER)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !marked {
+            continue;
+        }
+        let Some(obj) = part.as_object_mut() else {
+            continue;
+        };
+        // Only a still-present REAL is unstable; an existing sentinel is stable.
+        let has_real = obj
+            .get("thoughtSignature")
+            .or_else(|| obj.get("thought_signature"))
+            .and_then(|s| s.as_str())
+            .map(is_real_signature)
+            .unwrap_or(false);
+        if !has_real {
+            continue;
+        }
+        obj.remove("thought_signature");
+        obj.insert("thoughtSignature".to_string(), json!(SENTINEL_SIGNATURE));
+        if let Some(id) = obj
+            .get("functionCall")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            crate::proxy::signature_source_diagnostics::record_v2b_action(
+                id,
+                crate::proxy::signature_source_diagnostics::V2bAction::StabilizedToSentinel,
+            );
+        }
+        stabilized += 1;
+    }
+    stabilized
+}
+
 /// 四大协议统一思考补齐管线：确保所有 Gemini contents 中的 model 轮次在开启思考时，必须具备合法的思考块与签名
 pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_enabled: bool) {
-    for msg in contents.iter_mut() {
-        let is_model = matches!(
-            msg.get("role").and_then(|r| r.as_str()),
-            Some("model") | Some("assistant")
-        );
+    // [V2B] The live/current assistant turn is the LAST model turn; earlier model
+    // turns are historical. Session-latest fallback is only legitimate for the
+    // live turn. Computed once, before mutation.
+    let v2b_enabled = historical_session_fallback_stability_enabled();
+    let last_model_idx = contents.iter().rposition(is_model_or_assistant);
+
+    for (idx, msg) in contents.iter_mut().enumerate() {
+        let is_model = is_model_or_assistant(msg);
+
+        // [V2B] Apply the unresolved historical session-fallback policy while the
+        // internal markers are still present (they are stripped just below).
+        if v2b_enabled && is_thinking_enabled && is_model {
+            if let Some(last) = last_model_idx {
+                if idx < last {
+                    stabilize_historical_session_fallback_parts(msg);
+                }
+            }
+        }
+
+        // V2A markers are internal to the request pipeline only; never let them
+        // reach the upstream wire payload.
+        if let Some(obj) = msg.as_object_mut() {
+            obj.remove(SIG_FALLBACK_MARKER);
+        }
 
         if !is_thinking_enabled {
             // 当思考模式为关时，清洗所有角色部件（包括 functionResponse）上的签名
@@ -1029,6 +1276,7 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
                     if let Some(obj) = part.as_object_mut() {
                         obj.remove("thought_signature");
                         obj.remove("thoughtSignature");
+                        obj.remove(SIG_FALLBACK_MARKER);
                     }
                 }
             }
@@ -1046,6 +1294,7 @@ pub fn finalize_gemini_contents_thinking(contents: &mut [Value], is_thinking_ena
                 if let Some(obj) = part.as_object_mut() {
                     // 统一清洗向 Google 发送的非标准蛇形字段
                     obj.remove("thought_signature");
+                    obj.remove(SIG_FALLBACK_MARKER);
                 }
                 // 严格排除工具调用/返回：functionCall 也会带 thoughtSignature，
                 // 绝不能仅凭签名就判定为思考块，否则会漏补首位 thought、关思考时误删工具。
@@ -1416,9 +1665,68 @@ fn record_bytes(rec: &ThinkingRecord) -> usize {
 }
 
 fn is_stronger_record(new: &ThinkingRecord, old: &ThinkingRecord) -> bool {
-    new.thought.len() > old.thought.len()
-        || new.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-            > old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+    if signature_ownership_enabled() {
+        // V2A: metadata growth is always allowed, but a longer signature is NOT
+        // proof that it belongs to this historical turn. A different REAL must
+        // never transfer ownership; only sentinel/missing -> REAL, or an
+        // identical REAL, may strengthen the signature side.
+        let metadata_grew =
+            new.thought.len() > old.thought.len() || new.visible.len() > old.visible.len();
+        let sig_upgrade = match (new.signature.as_deref(), old.signature.as_deref()) {
+            (_, Some(o)) if is_real_signature(o) => new.signature.as_deref() == Some(o),
+            (Some(n), _) if is_real_signature(n) => true,
+            _ => false,
+        };
+        metadata_grew || sig_upgrade
+    } else {
+        new.thought.len() > old.thought.len()
+            || new.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                > old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
+/// V2A: combine a newer candidate record with the record already owned by a
+/// historical turn. Metadata (thought/visible text, tool association) may be
+/// enriched, but once `old` owns a REAL signature it is retained verbatim.
+/// Legacy mode returns `new` unchanged, preserving prior behavior exactly.
+fn merge_record_ownership(new: ThinkingRecord, old: &ThinkingRecord) -> ThinkingRecord {
+    if !signature_ownership_enabled() {
+        return new;
+    }
+
+    let signature = match (new.signature.as_deref(), old.signature.as_deref()) {
+        (_, Some(o)) if is_real_signature(o) => Some(o.to_string()),
+        (Some(n), _) if is_real_signature(n) => Some(n.to_string()),
+        (Some(n), Some(o)) => Some(if n.len() >= o.len() { n } else { o }.to_string()),
+        (Some(n), None) => Some(n.to_string()),
+        (None, Some(o)) => Some(o.to_string()),
+        (None, None) => None,
+    };
+
+    ThinkingRecord {
+        fingerprint: new.fingerprint,
+        thought: if new.thought.len() >= old.thought.len() {
+            new.thought
+        } else {
+            old.thought.clone()
+        },
+        signature,
+        tool_ids: if new.tool_ids.is_empty() {
+            old.tool_ids.clone()
+        } else {
+            new.tool_ids
+        },
+        tool_names: if new.tool_names.is_empty() {
+            old.tool_names.clone()
+        } else {
+            new.tool_names
+        },
+        visible: if new.visible.len() >= old.visible.len() {
+            new.visible
+        } else {
+            old.visible.clone()
+        },
+    }
 }
 
 fn match_existing_record(
@@ -2548,5 +2856,361 @@ mod tests {
             parts[0].get("thoughtSignature").is_none(),
             "thoughtSignature must be removed from functionResponse when thinking is disabled"
         );
+    }
+
+    // ==================================================================
+    // [V2A] ThinkingStore historical REAL immutability
+    // ==================================================================
+
+    const V2A_STORE_SIG_A: &str =
+        "V2A_STORE_REAL_A_01234567890123456789012345678901234567890123456789012345";
+    const V2A_STORE_SIG_B: &str =
+        "V2A_STORE_REAL_B_98765432109876543210987654321098765432109876543210987654";
+
+    fn rec_with_sig(thought: &str, visible: &str, sig: &str) -> ThinkingRecord {
+        ThinkingRecord {
+            fingerprint: fingerprint(visible, &[], &[]),
+            thought: thought.to_string(),
+            signature: Some(sig.to_string()),
+            tool_ids: Vec::new(),
+            tool_names: Vec::new(),
+            visible: visible.to_string(),
+        }
+    }
+
+    fn restore_thought_and_sig(
+        store: &ThinkingStore,
+        key: &str,
+        visible: &str,
+    ) -> (String, String) {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [{ "text": visible }]
+        })];
+        store.restore_gemini_contents(key, &mut contents);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        let thought = parts[0]["text"].as_str().unwrap_or("").to_string();
+        let sig = parts[0]["thoughtSignature"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        (thought, sig)
+    }
+
+    #[test]
+    fn v2a_7_store_metadata_may_grow_while_real_a_remains_a() {
+        let store = ThinkingStore::new();
+        let key = format!("t:v2a7-{}", uuid::Uuid::new_v4());
+        set_signature_ownership_override(Some(true));
+
+        store.record(&key, rec_with_sig("short", "answer", V2A_STORE_SIG_A));
+        store.record(
+            &key,
+            rec_with_sig(
+                "a considerably longer thought that is pure metadata enrichment",
+                "answer",
+                V2A_STORE_SIG_B,
+            ),
+        );
+
+        let (thought, sig) = restore_thought_and_sig(&store, &key, "answer");
+        assert_eq!(
+            thought,
+            "a considerably longer thought that is pure metadata enrichment"
+        );
+        assert_eq!(
+            sig, V2A_STORE_SIG_A,
+            "thought may grow but historical REAL A must stay A"
+        );
+
+        set_signature_ownership_override(None);
+        store.end_session(&key);
+    }
+
+    #[test]
+    fn v2a_8_identical_real_a_is_harmless() {
+        let store = ThinkingStore::new();
+        let key = format!("t:v2a8-{}", uuid::Uuid::new_v4());
+        set_signature_ownership_override(Some(true));
+
+        store.record(&key, rec_with_sig("short", "answer", V2A_STORE_SIG_A));
+        store.record(
+            &key,
+            rec_with_sig(
+                "longer thought, same owned signature",
+                "answer",
+                V2A_STORE_SIG_A,
+            ),
+        );
+
+        let (thought, sig) = restore_thought_and_sig(&store, &key, "answer");
+        assert_eq!(thought, "longer thought, same owned signature");
+        assert_eq!(sig, V2A_STORE_SIG_A);
+
+        set_signature_ownership_override(None);
+        store.end_session(&key);
+    }
+
+    #[test]
+    fn v2a_legacy_store_merge_still_takes_later_signature_when_flag_off() {
+        let store = ThinkingStore::new();
+        let key = format!("t:v2a-legacy-{}", uuid::Uuid::new_v4());
+        set_signature_ownership_override(Some(false));
+
+        store.record(&key, rec_with_sig("short", "answer", V2A_STORE_SIG_A));
+        store.record(
+            &key,
+            rec_with_sig("a considerably longer thought", "answer", V2A_STORE_SIG_B),
+        );
+
+        let (_thought, sig) = restore_thought_and_sig(&store, &key, "answer");
+        assert_eq!(
+            sig, V2A_STORE_SIG_B,
+            "legacy mode must keep the previous longer/later signature behavior"
+        );
+
+        set_signature_ownership_override(None);
+        store.end_session(&key);
+    }
+
+    #[test]
+    fn v2a_is_stronger_requires_owned_signature_upgrade() {
+        set_signature_ownership_override(Some(true));
+
+        let old = rec_with_sig("same", "v", V2A_STORE_SIG_A);
+        let different = rec_with_sig(
+            "same",
+            "v",
+            "V2A_STORE_REAL_C_111111111111111111111111111111111111111111111111111111",
+        );
+        let identical = rec_with_sig("same", "v", V2A_STORE_SIG_A);
+        let from_none = ThinkingRecord {
+            signature: None,
+            ..rec_with_sig("same", "v", V2A_STORE_SIG_A)
+        };
+
+        assert!(
+            !is_stronger_record(&different, &old),
+            "a different REAL must not be stronger"
+        );
+        assert!(is_stronger_record(&identical, &old));
+        assert!(is_stronger_record(
+            &rec_with_sig("same", "v", V2A_STORE_SIG_B),
+            &from_none
+        ));
+
+        set_signature_ownership_override(None);
+    }
+
+    #[test]
+    fn v2a_ingest_fallback_marker_does_not_transfer_ownership() {
+        let store = ThinkingStore::new();
+        let key = format!("t:v2a-ingest-{}", uuid::Uuid::new_v4());
+        set_signature_ownership_override(Some(true));
+
+        store.record(&key, rec_with_sig("authored", "answer", V2A_STORE_SIG_A));
+
+        let mut incoming = json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "client reasoning that is longer than the authored thought",
+                    "thought": true,
+                    "thoughtSignature": V2A_STORE_SIG_B
+                },
+                { "text": "answer" }
+            ]
+        });
+        incoming[SIG_FALLBACK_MARKER] = json!(true);
+        store.ingest_from_contents(&key, &[incoming]);
+
+        let (thought, sig) = restore_thought_and_sig(&store, &key, "answer");
+        assert!(
+            thought.contains("longer than the authored thought"),
+            "capturable thought text may still be ingested as metadata"
+        );
+        assert_eq!(
+            sig, V2A_STORE_SIG_A,
+            "fallback-marked session-latest B must not become this turn's REAL"
+        );
+
+        set_signature_ownership_override(None);
+        store.end_session(&key);
+    }
+
+    #[test]
+    fn v2a_9_live_accumulator_progresses_to_final_real() {
+        let partial = "P".repeat(56);
+        let final_sig = "F".repeat(80);
+
+        let mut acc = TurnAccumulator::new();
+        acc.ingest_part(&json!({ "text": "thinking", "thought": true }));
+        acc.ingest_part(&json!({
+            "text": " more",
+            "thought": true,
+            "thoughtSignature": partial
+        }));
+        acc.ingest_part(&json!({
+            "text": " final",
+            "thought": true,
+            "thoughtSignature": final_sig
+        }));
+
+        assert_eq!(
+            acc.signature.as_deref(),
+            Some(final_sig.as_str()),
+            "live capture must still progress missing -> partial -> authoritative final REAL"
+        );
+    }
+
+    #[test]
+    fn v2a_finalize_strips_internal_fallback_marker() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "...", "thought": true, "thoughtSignature": V2A_STORE_SIG_B },
+                {
+                    "functionCall": { "name": "shell", "id": "call_marker", "args": {} },
+                    "thoughtSignature": V2A_STORE_SIG_B
+                }
+            ]
+        })];
+        contents[0][SIG_FALLBACK_MARKER] = json!(true);
+
+        finalize_gemini_contents_thinking(&mut contents, true);
+
+        assert!(
+            contents[0].get(SIG_FALLBACK_MARKER).is_none(),
+            "internal marker must never reach the serialized wire payload"
+        );
+    }
+
+    // ==================================================================
+    // [V2B] Historical session-fallback stability unit tests
+    // ==================================================================
+
+    fn v2b_three_turn_marked_contents(real_a: &str, real_c: &str) -> Vec<Value> {
+        let marked_fc = |id: &str, sig: &str| -> Value {
+            let mut part = json!({
+                "functionCall": { "name": "task", "id": id, "args": {} },
+                "thoughtSignature": sig,
+            });
+            part[SIG_FALLBACK_MARKER] = json!(true);
+            part
+        };
+        vec![
+            json!({ "role": "model", "parts": [marked_fc("call_v2b_hist_a", real_a)] }),
+            json!({ "role": "model", "parts": [marked_fc("call_v2b_hist_b", SENTINEL_SIGNATURE)] }),
+            json!({ "role": "model", "parts": [marked_fc("call_v2b_live_c", real_c)] }),
+        ]
+    }
+
+    fn v2b_fc_sig(content: &Value, id: &str) -> Option<String> {
+        content["parts"]
+            .as_array()?
+            .iter()
+            .find(|p| p["functionCall"]["id"].as_str() == Some(id))
+            .and_then(|p| p["thoughtSignature"].as_str().map(str::to_string))
+    }
+
+    #[test]
+    fn v2b_flag_parsing_matches_documented_values() {
+        assert!(!parse_historical_session_fallback_stability_flag(None));
+        assert!(!parse_historical_session_fallback_stability_flag(Some("0")));
+        assert!(parse_historical_session_fallback_stability_flag(Some("1")));
+        assert!(parse_historical_session_fallback_stability_flag(Some("true")));
+    }
+
+    #[test]
+    fn v2b_9_thinking_disabled_unchanged() {
+        let mut fc_part = json!({
+            "functionCall": { "name": "task", "id": "call_v2b9", "args": {} },
+            "thoughtSignature": V2A_STORE_SIG_A,
+        });
+        fc_part[SIG_FALLBACK_MARKER] = json!(true);
+        let mut contents = vec![
+            json!({ "role": "model", "parts": [fc_part] }),
+            json!({ "role": "model", "parts": [{ "text": "all done" }] }),
+        ];
+
+        set_historical_session_fallback_stability_override(Some(true));
+        finalize_gemini_contents_thinking(&mut contents, false);
+        set_historical_session_fallback_stability_override(None);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        let fc = parts
+            .iter()
+            .find(|p| p.get("functionCall").is_some())
+            .expect("functionCall part present");
+        assert!(
+            fc.get("thoughtSignature").is_none(),
+            "thinking-off legacy behavior must strip the signature entirely"
+        );
+        assert!(
+            fc.get(SIG_FALLBACK_MARKER).is_none(),
+            "internal marker must be stripped"
+        );
+    }
+
+    #[test]
+    fn v2b_finalize_historical_only_and_precise() {
+        let mut contents = v2b_three_turn_marked_contents(V2A_STORE_SIG_A, V2A_STORE_SIG_B);
+
+        set_historical_session_fallback_stability_override(Some(true));
+        finalize_gemini_contents_thinking(&mut contents, true);
+        set_historical_session_fallback_stability_override(None);
+
+        assert_eq!(
+            v2b_fc_sig(&contents[0], "call_v2b_hist_a").as_deref(),
+            Some(SENTINEL_SIGNATURE),
+            "historical unresolved REAL A must become the sentinel"
+        );
+        assert_eq!(
+            v2b_fc_sig(&contents[1], "call_v2b_hist_b").as_deref(),
+            Some(SENTINEL_SIGNATURE),
+            "historical existing sentinel must stay the sentinel"
+        );
+        assert_eq!(
+            v2b_fc_sig(&contents[2], "call_v2b_live_c").as_deref(),
+            Some(V2A_STORE_SIG_B),
+            "live/last model turn REAL C must stay untouched"
+        );
+        for content in &contents {
+            for part in content["parts"].as_array().unwrap() {
+                assert!(
+                    part.get(SIG_FALLBACK_MARKER).is_none(),
+                    "internal marker must be stripped everywhere"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2b_finalize_flag_off_no_op() {
+        let mut contents = v2b_three_turn_marked_contents(V2A_STORE_SIG_A, V2A_STORE_SIG_B);
+
+        set_historical_session_fallback_stability_override(Some(false));
+        finalize_gemini_contents_thinking(&mut contents, true);
+        set_historical_session_fallback_stability_override(None);
+
+        assert_eq!(
+            v2b_fc_sig(&contents[0], "call_v2b_hist_a").as_deref(),
+            Some(V2A_STORE_SIG_A),
+            "V2B off must keep the historical REAL A"
+        );
+        assert_eq!(
+            v2b_fc_sig(&contents[1], "call_v2b_hist_b").as_deref(),
+            Some(SENTINEL_SIGNATURE)
+        );
+        assert_eq!(
+            v2b_fc_sig(&contents[2], "call_v2b_live_c").as_deref(),
+            Some(V2A_STORE_SIG_B),
+            "V2B off must keep the live REAL C"
+        );
+        for content in &contents {
+            for part in content["parts"].as_array().unwrap() {
+                assert!(part.get(SIG_FALLBACK_MARKER).is_none());
+            }
+        }
     }
 }
